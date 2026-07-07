@@ -1,6 +1,10 @@
 import argparse
 import time
 import threading
+import sys
+import termios
+import tty
+import select
 
 import rclpy
 from rclpy.node import Node
@@ -83,6 +87,11 @@ class PSMControl():
         # regardless of callback-group config. The sensor callbacks are NOT
         # gated by this, so measured_cp keeps updating for closed-loop control.
         self._control_lock = threading.Lock()
+
+        # set by the keyboard listener when space is pressed: aborts the current
+        # motion (robot holds its last commanded pose). Cleared when the next
+        # goal/jaw message starts being processed.
+        self._stop_motion = threading.Event()
 
         self.init_cam2base(args)
         self.pose_init = False # set to true when messages arrive
@@ -271,8 +280,38 @@ class PSMControl():
         print("-------------------------------")
 
 
+    def keyboard_listener(self):
+        """
+        Read single keypresses from the terminal. Pressing SPACE aborts the
+        current motion (the control loops check self._stop_motion and stop, so
+        the robot holds its last commanded pose); the stop clears automatically
+        when the next goal/jaw message starts processing. Runs in its own thread.
+        """
+        if not sys.stdin.isatty():
+            self.node.get_logger().warn(
+                "stdin is not a TTY; spacebar stop is disabled.")
+            return
+
+        print("[keyboard] press SPACE to stop motion (waits for next message)")
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)  # read keys without waiting for Enter
+            while rclpy.ok():
+                # poll with a timeout so we can notice rclpy shutting down
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if r:
+                    ch = sys.stdin.read(1)
+                    if ch == ' ':
+                        self._stop_motion.set()
+                        print("\n[STOP] space pressed - halting motion, "
+                              "waiting for next message")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
     def control_PSM(self, psm, goal_pose_base_fee, pos_dist_th = 1e-3, angle_dist_th = 3 * np.pi / 180):
         # goal_pose_base_fee: (qw, qx, qy, qz, x, y, z), FEE pose in the PSM base frame
+        self._stop_motion.clear()  # a new goal resumes motion after a space-stop
         self.controlPoseFeeInBase(psm,
                                   goal_pose_base_fee,
                                   pos_dist_th=pos_dist_th,
@@ -295,6 +334,7 @@ class PSMControl():
         if not (-20 <= degree <= 90):
             print(f"degree goal is out of bound [-20 - 100], goal: {degree}")
             pdb.set_trace()
+        self._stop_motion.clear()  # a new jaw goal resumes motion after a space-stop
         if psm in [1, 2]:
             if degree == 0:
                 degree = -9
@@ -306,6 +346,9 @@ class PSMControl():
             n_steps = max(int(np.ceil(abs(degree - init_degree) / max_step_deg)), 1)
             interp = np.linspace(init_degree, degree, n_steps + 1)[1:]  # skip current angle
             for step in interp:
+                if self._stop_motion.is_set():  # space pressed -> abort jaw motion
+                    print("[STOP] jaw motion interrupted; waiting for next message")
+                    return
                 # optional stuck detection (threshold unverified -> off by default,
                 # so the jaw always drives all the way to the commanded angle)
                 if stop_on_effort and self.jaw_effort['psm_{}'.format(psm)] is not None:
@@ -440,6 +483,12 @@ class PSMControl():
                   f"goal pos: {goal_pos}, offset: {goal_pos - np.asarray(cur[-3:], dtype=float)}")
 
         for _ in range(max_iters):
+            # 0. Space pressed -> abort; stop publishing so the robot holds its
+            #    last commanded pose, and wait for the next goal message.
+            if self._stop_motion.is_set():
+                print("[STOP] motion interrupted; waiting for next message")
+                return
+
             # 1. Re-read the LIVE base->FEE pose from measured_cp (closed-loop).
             #    self.pose_base_fee* is kept fresh by the sensor callback thread.
             try:
@@ -501,6 +550,10 @@ if __name__ == "__main__":
     executor.add_node(move.node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
+
+    # keyboard listener: SPACE stops the current motion until the next message
+    kb_thread = threading.Thread(target=move.keyboard_listener, daemon=True)
+    kb_thread.start()
 
     try:
         move.node.get_logger().info("Waiting for first synced psm poses...")
