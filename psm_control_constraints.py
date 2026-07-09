@@ -20,6 +20,7 @@ import transforms3d.quaternions as quaternions
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 
 # os.environ['ROS_DOMAIN_ID'] = '111'
 
@@ -52,6 +53,16 @@ def slerp(q_now, q_end, max_move_angle=3.):
     on_q_end /= np.linalg.norm(on_q_end)
     return q_now * np.cos(move_angle) + on_q_end * np.sin(move_angle)
 
+
+# 180 deg rotation about the tool's local z (shaft) axis, quat (w, x, y, z).
+# A symmetric gripper grasps the same after this flip, so we can choose whichever
+# roll representation of a goal keeps the wrist roll joint away from its limit.
+Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
+
+# index of the tool-roll joint in /PSM*/measured_js.
+# dVRK PSM joint order: [outer_yaw, outer_pitch, insertion, roll, wrist_pitch, wrist_yaw]
+ROLL_JOINT_IDX = 3
+
 """
 reads goal position commands from ros for psm1 and psm2
 reads jaw control commands from ros for psm1 and psm2
@@ -77,6 +88,12 @@ class PSMControl():
         self.pose_base_fee2 = None
         self.jaw_effort = {'psm_1': None, 'psm_2': None}  # latest jaw effort (N·m)
         self.desired_jaw = {1: None, 2: None}  # latest commanded jaw angle (deg)
+        self.psm1_joints = None  # latest /PSM1/measured_js positions (rad/m)
+        self.psm2_joints = None
+        # gripper orientation (wxyz) with the tool-roll joint at 0, captured once
+        # (computed from measured pose + roll joint, no motion). Goal roll is
+        # chosen nearest this so the wrist roll joint stays near 0, off its limit.
+        self.init_quat = {1: None, 2: None}
 
         # control callbacks (goal / jaw_goal) run blocking loops; put them in a
         # separate callback group so a MultiThreadedExecutor keeps servicing the
@@ -170,6 +187,17 @@ class PSMControl():
         self.set_ee2_pub = self.node.create_publisher(
             PoseStamped, '/PSM2/servo_cp', 10)
 
+        # published (Bool True) when a PSM move finishes (goal reached, settled,
+        # or max iters) so the sim knows it can send the next step.
+        self.done_pub_1 = self.node.create_publisher(Bool, '/PSM1/done', 10)
+        self.done_pub_2 = self.node.create_publisher(Bool, '/PSM2/done', 10)
+
+        # joint states, for the tool-roll joint used to compute the zero-roll ref
+        self.node.create_subscription(
+            JointState, '/PSM1/measured_js', lambda m: self._joint_cb(m, 1), 10)
+        self.node.create_subscription(
+            JointState, '/PSM2/measured_js', lambda m: self._joint_cb(m, 2), 10)
+
     def init_cam2base(self, args):
         calib = args.psm_calibrate
         if not Path(calib).exists():
@@ -255,6 +283,46 @@ class PSMControl():
         ori = pose_msg.pose.orientation
         return np.array([ori.w, ori.x, ori.y, ori.z, pos.x, pos.y, pos.z])
 
+    def _joint_cb(self, msg, psm_id):
+        """Store the latest /PSM*/measured_js joint positions."""
+        if psm_id == 1:
+            self.psm1_joints = np.array(msg.position)
+        else:
+            self.psm2_joints = np.array(msg.position)
+
+    def _zero_roll_ref(self, psm_id):
+        """
+        Orientation of the gripper with the tool-roll joint at 0, computed from
+        the current measured pose and roll joint -- no motion. Used as the roll
+        reference so goal-roll selection biases the roll joint toward 0 (mid
+        range), away from its limit.
+
+        Assumes the tool shaft is the FEE local z axis, so the roll joint
+        rotates the tip about local z; de-rolling removes that rotation.
+        Returns (qw,qx,qy,qz) or None if pose/joints not available yet.
+        """
+        pose = self.pose_base_fee1 if psm_id == 1 else self.pose_base_fee2
+        joints = self.psm1_joints if psm_id == 1 else self.psm2_joints
+        if pose is None or joints is None or len(joints) <= ROLL_JOINT_IDX:
+            return None
+        roll = float(joints[ROLL_JOINT_IDX])
+        # de-roll: R_tip(0) = R_tip(roll) * Rz_local(-roll)
+        q_deroll = np.array([np.cos(-roll / 2.0), 0.0, 0.0, np.sin(-roll / 2.0)])
+        return quaternions.qmult(pose[:4], q_deroll)
+
+    def _nearest_roll_goal(self, goal_quat, ref_quat):
+        """
+        A symmetric gripper grasps the same after a 180 deg roll about its shaft.
+        Return whichever of {goal, goal rolled 180 deg about local z} keeps the
+        gripper orientation nearest ref_quat, so the wrist roll joint stays close
+        to its (in-range) startup value instead of wrapping toward a limit.
+        """
+        goal_quat = np.asarray(goal_quat, dtype=float)
+        flipped = quaternions.qmult(goal_quat, Q_ROLL_FLIP)
+        d_goal, _ = angleDist(goal_quat, ref_quat)
+        d_flip, _ = angleDist(flipped, ref_quat)
+        return flipped if d_flip < d_goal else goal_quat
+
     def debug_sync_status(self):
         if self.pose_init:
             return # Stop spamming once we successfully sync
@@ -318,7 +386,7 @@ class PSMControl():
                                   angle_dist_th=angle_dist_th,
                                   )
 
-    def control_jaw(self, psm, degree, max_step_deg=2.0, sleep=0.005, stop_on_effort=False):
+    def control_jaw(self, psm, degree, max_step_deg=0.5, sleep=0.005, stop_on_effort=False):
         '''
         when psm is grasping needle, check jaw angle
         psm_1 open jaw angle 1.04703528
@@ -357,6 +425,9 @@ class PSMControl():
                         print(f"Jaw stuck? Jaw effort: {self.jaw_effort['psm_{}'.format(psm)]}")
                         break
                 self.openGripperDegree(psm, degree=float(step), sleep=sleep)
+            # jaw move finished (reached target or effort-stopped, NOT space-stop
+            # which returns early) -> tell the sim it can send the next step
+            self._publish_done(psm)
         else:
             self.openGripperDegree(psm, degree=degree, sleep=1)
 
@@ -401,6 +472,11 @@ class PSMControl():
             self._setGripper(self.set_gripper2_pub, end_pos=degree)
         time.sleep(sleep)
 
+    def _publish_done(self, psm_id):
+        """Signal that a PSM move finished so the sim can send the next step."""
+        pub = self.done_pub_1 if psm_id == 1 else self.done_pub_2
+        pub.publish(Bool(data=True))
+
     # quat: wxyz
     def _publishPoseBaseFee(self, psm_id, set_ee_pub, pos, quat, sleep_time=0.01):
         msg = PoseStamped()
@@ -423,9 +499,9 @@ class PSMControl():
         self,
         psm_id: int,
         goal_pose_base_fee: np.ndarray,
-        pos_dist_th: float = 1e-3,
+        pos_dist_th: float = 1e-4,
         angle_dist_th: float = 5 * np.pi / 180,
-        pos_step: float = 2e-3,
+        pos_step: float = 1e-3,
         angle_step_deg: float = 2.0,
         sleep: float = 0.005,
         max_iters: int = 5000,
@@ -472,8 +548,26 @@ class PSMControl():
                 maintain_jaw_angle = 60.0  # Fallback to 60 degrees open if it fails
         print(f"maintain jaw angle: {maintain_jaw_angle}")
 
+        # Command the jaw ONCE, before the servo_cp loop, then let dVRK hold it.
+        # On a dVRK PSM the jaw is joint 7 of the same arm/controller, so a
+        # jaw/servo_jp command forces the arm into JOINT_SPACE while servo_cp
+        # forces CARTESIAN_SPACE. Interleaving them every iteration made the arm
+        # flip-flop control spaces (JOINT<->CARTESIAN), which trips a PID
+        # tracking-error fault on the wrist_yaw joint. Sending the jaw once here
+        # (and only servo_cp in the loop) keeps the arm in CARTESIAN_SPACE.
+        self.openGripperDegree(psm_id=psm_id, degree=maintain_jaw_angle, sleep=0.05)
+
         goal_pos = np.asarray(goal_pose_base_fee[-3:], dtype=float)
         goal_quat = np.asarray(goal_pose_base_fee[:4], dtype=float)
+
+        # choose the roll representation (goal or 180 deg shaft flip) nearest the
+        # zero-roll orientation so the wrist roll joint stays near 0 (off its
+        # limit). The reference is captured once, computed from joints (no motion).
+        if self.init_quat.get(psm_id) is None:
+            self.init_quat[psm_id] = self._zero_roll_ref(psm_id)
+        ref_quat = self.init_quat.get(psm_id)
+        if ref_quat is not None:
+            goal_quat = self._nearest_roll_goal(goal_quat, ref_quat)
 
         # --- DEBUG: current measured pose vs goal, both base->FEE. When the robot
         # is already at the goal this offset should be ~0.
@@ -481,6 +575,15 @@ class PSMControl():
         if cur is not None:
             print(f"[goal check] PSM{psm_id} current base_fee pos: {np.asarray(cur[-3:])}, "
                   f"goal pos: {goal_pos}, offset: {goal_pos - np.asarray(cur[-3:], dtype=float)}")
+
+        # no-progress ("settled") detection: if the robot can't get any closer to
+        # the goal (steady-state tracking error below the thresholds), stop early
+        # instead of holding the control lock for all max_iters. This lets the
+        # next command (e.g. the gripper) run promptly.
+        best_pos_dist = np.inf
+        best_angle_dist = np.inf
+        no_improve = 0
+        settle_iters = 400  # ~2 s at sleep=5 ms with no improvement -> give up
 
         for _ in range(max_iters):
             # 0. Space pressed -> abort; stop publishing so the robot holds its
@@ -507,6 +610,21 @@ class PSMControl():
             if pos_dist < pos_dist_th and angle_dist < angle_dist_th:
                 break
 
+            # 2b. Track best-so-far; if neither distance improves for a while the
+            #     arm has settled as close as it can get -> stop and move on.
+            #     Tolerances are above sensor noise so noise doesn't reset it.
+            if pos_dist < best_pos_dist - 5e-5 or angle_dist < best_angle_dist - 5e-4:
+                best_pos_dist = min(best_pos_dist, pos_dist)
+                best_angle_dist = min(best_angle_dist, angle_dist)
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= settle_iters:
+                    print(f"[settled] PSM{psm_id} no further progress "
+                          f"(pos_dist={pos_dist:.4f} m, angle_dist={angle_dist:.4f} rad); "
+                          f"moving on")
+                    break
+
             # 3. Take one small step toward the goal from the live current pose
             if pos_dist > 1e-9:
                 next_pos = current_pos + \
@@ -519,9 +637,10 @@ class PSMControl():
             else:
                 next_quat = current_quat
 
-            # 4. Publish the base->FEE command directly to servo_cp
-            # hold the jaw angle while servoing the cartesian pose
-            self.openGripperDegree(psm_id=psm_id, degree=maintain_jaw_angle, sleep=0.0)
+            # 4. Publish the base->FEE command directly to servo_cp.
+            #    The jaw was commanded once before the loop; do NOT re-send
+            #    jaw/servo_jp here -- doing so flips the arm into JOINT_SPACE and
+            #    back to CARTESIAN_SPACE every iteration, which faults the wrist.
             self._publishPoseBaseFee(
                 psm_id=psm_id,
                 set_ee_pub=set_ee_pub,
@@ -531,6 +650,10 @@ class PSMControl():
             )
         else:
             print("max iters reached")
+
+        # reached here on goal-reached, settle, or max-iters (NOT on a space stop,
+        # which returns early) -> the move is done, tell the sim.
+        self._publish_done(psm_id)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
