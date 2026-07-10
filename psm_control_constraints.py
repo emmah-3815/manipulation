@@ -10,6 +10,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.qos import (QoSProfile, QoSDurabilityPolicy,
+                       QoSReliabilityPolicy, QoSHistoryPolicy)
 from pathlib import Path
 import pdb
 from scipy.spatial.transform import Rotation as R
@@ -21,6 +23,7 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
+from crtk_msgs.msg import OperatingState, StringStamped
 
 # os.environ['ROS_DOMAIN_ID'] = '111'
 
@@ -63,6 +66,96 @@ Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
 # dVRK PSM joint order: [outer_yaw, outer_pitch, insertion, roll, wrist_pitch, wrist_yaw]
 ROLL_JOINT_IDX = 3
 
+# ---------------------------------------------------------------------------
+# Collision-avoidance / homing configuration (all distances in meters).
+#
+# Each arm is modeled as a capsule: the line segment from its base origin (RCM)
+# to its gripper tip (FEE), i.e. the instrument shaft. Two arms are kept apart
+# by requiring the shaft-shaft centerline distance and the tip-tip distance to
+# stay above these clearances. TUNE these to your instruments/setup.
+# ---------------------------------------------------------------------------
+SHAFT_CLEARANCE = 0.012   # min centerline distance between the two shafts (planning)
+TIP_CLEARANCE = 0.012     # min distance between the two gripper tips (planning)
+SHAFT_HARD_MIN = 0.008    # live safety guard during execution -> abort if breached
+
+# RRT (planned in the moving arm's base frame, R^3 tip position)
+RRT_STEP = 0.005          # extend distance per tree edge (m)
+RRT_GOAL_BIAS = 0.10      # probability of sampling the goal
+RRT_MAX_ITERS = 4000      # give up after this many samples
+RRT_COLLISION_RES = 0.002 # edge collision-check spacing (m)
+RRT_SAMPLE_MARGIN = 0.05  # expand the start/goal bbox by this when sampling (m)
+RRT_SHORTCUT_ITERS = 150  # path-smoothing attempts
+
+# waypoint-following tolerances (intermediate waypoints just pass through)
+WAYPOINT_POS_TH = 3e-3
+WAYPOINT_ANG_TH = 10 * np.pi / 180
+
+# --- joint-space homing ('h' key) -------------------------------------------
+# retracted config, dVRK PSM order [outer_yaw, outer_pitch, insertion(m),
+# roll, wrist_pitch, wrist_yaw]: arm centered, wrist straight, tool withdrawn.
+# TUNE the insertion (index 2) so the tool is safely retracted for your setup.
+RETRACTED_JS = np.array([-0.7, 0.00, 0.06, 0.0, 0.0, 0.0])
+# jaw angle (deg) to open to before retracting, so the tool withdraws open.
+OPEN_JAW_DEG = 40.0
+# max increment per published command, per joint (rad for revolute, m for insertion).
+# Smaller -> more steps at the same publish cadence -> slower, smoother homing.
+HOME_JOINT_STEP = np.array([0.002, 0.002, 0.00010, 0.002, 0.002, 0.002])
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(v, hi))
+
+
+def seg_seg_dist(p1, q1, p2, q2):
+    """
+    Shortest distance between 3D segments [p1,q1] and [p2,q2]
+    (Ericson, Real-Time Collision Detection, ClosestPtSegmentSegment).
+    """
+    p1 = np.asarray(p1, float); q1 = np.asarray(q1, float)
+    p2 = np.asarray(p2, float); q2 = np.asarray(q2, float)
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(d1 @ d1)
+    e = float(d2 @ d2)
+    f = float(d2 @ r)
+    EPS = 1e-12
+    if a <= EPS and e <= EPS:
+        return float(np.linalg.norm(p1 - p2))
+    if a <= EPS:
+        s, t = 0.0, _clamp(f / e, 0.0, 1.0)
+    else:
+        c = float(d1 @ r)
+        if e <= EPS:
+            t, s = 0.0, _clamp(-c / a, 0.0, 1.0)
+        else:
+            b = float(d1 @ d2)
+            denom = a * e - b * b
+            s = _clamp((b * f - c * e) / denom, 0.0, 1.0) if denom > EPS else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t, s = 0.0, _clamp(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t, s = 1.0, _clamp((b - c) / a, 0.0, 1.0)
+    c1 = p1 + d1 * s
+    c2 = p2 + d2 * t
+    return float(np.linalg.norm(c1 - c2))
+
+
+def slerp_frac(q0, q1, frac):
+    """Interpolate `frac` (0..1) of the way from q0 to q1 (quats wxyz)."""
+    ad, q0 = angleDist(np.asarray(q0, float), np.asarray(q1, float))
+    if ad < 1e-6:
+        return np.asarray(q1, float)
+    move = frac * ad
+    on = q1 - np.dot(q0, q1) * q0
+    n = np.linalg.norm(on)
+    if n < 1e-9:
+        return np.asarray(q1, float)
+    on /= n
+    return q0 * np.cos(move) + on * np.sin(move)
+
+
 """
 reads goal position commands from ros for psm1 and psm2
 reads jaw control commands from ros for psm1 and psm2
@@ -94,6 +187,19 @@ class PSMControl():
         # (computed from measured pose + roll joint, no motion). Goal roll is
         # chosen nearest this so the wrist roll joint stays near 0, off its limit.
         self.init_quat = {1: None, 2: None}
+
+        # latest /PSM*/operating_state (crtk). Toggling teleop on/off in the dVRK
+        # console can leave the arm FAULTed / not-ENABLED; commanding the jaw or
+        # pose then triggers "arm not ready" faults. We watch this and re-enable
+        # before commanding. Each entry: dict(state, is_homed, is_busy) or None.
+        self.operating_state = {1: None, 2: None}
+        self._warned_no_state = {1: False, 2: False}  # warn once if state absent
+
+        # set while a homing/retract ('h' key) sequence is running, so repeated
+        # presses don't stack multiple homing threads.
+        self._homing = threading.Event()
+        # seeded RNG for the RRT planner (reproducible paths).
+        self._rng = np.random.default_rng(0)
 
         # control callbacks (goal / jaw_goal) run blocking loops; put them in a
         # separate callback group so a MultiThreadedExecutor keeps servicing the
@@ -186,6 +292,11 @@ class PSMControl():
             PoseStamped, '/PSM1/servo_cp', 10)
         self.set_ee2_pub = self.node.create_publisher(
             PoseStamped, '/PSM2/servo_cp', 10)
+        # arm joint servo, used only by the 'h' joint-space homing/retract.
+        self.set_arm_jp_pub = {
+            1: self.node.create_publisher(JointState, '/PSM1/servo_jp', 10),
+            2: self.node.create_publisher(JointState, '/PSM2/servo_jp', 10),
+        }
 
         # published (Bool True) when a PSM move finishes (goal reached, settled,
         # or max iters) so the sim knows it can send the next step.
@@ -197,6 +308,34 @@ class PSMControl():
             JointState, '/PSM1/measured_js', lambda m: self._joint_cb(m, 1), 10)
         self.node.create_subscription(
             JointState, '/PSM2/measured_js', lambda m: self._joint_cb(m, 2), 10)
+
+        # operating-state feedback + state_command to enable/home/clear FAULT.
+        # These stay in the default callback group (NOT control_cb_group) so they
+        # keep updating on another executor thread while a control loop blocks.
+        #
+        # The dVRK bridge publishes operating_state from a LATCHED event
+        # (AddPublisherFromEventWrite, latched=true -> transient_local QoS) and
+        # only ON CHANGE, not periodically. A default (volatile) subscriber never
+        # receives the latched sample and, since the state hasn't changed since
+        # the arm came up, gets nothing at all. Match the publisher with a
+        # transient_local + reliable profile so we receive the current state
+        # immediately on subscription.
+        state_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.node.create_subscription(
+            OperatingState, '/PSM1/operating_state',
+            lambda m: self._operating_state_cb(m, 1), state_qos)
+        self.node.create_subscription(
+            OperatingState, '/PSM2/operating_state',
+            lambda m: self._operating_state_cb(m, 2), state_qos)
+        self.state_cmd_pub = {
+            1: self.node.create_publisher(StringStamped, '/PSM1/state_command', 10),
+            2: self.node.create_publisher(StringStamped, '/PSM2/state_command', 10),
+        }
 
     def init_cam2base(self, args):
         calib = args.psm_calibrate
@@ -290,6 +429,79 @@ class PSMControl():
         else:
             self.psm2_joints = np.array(msg.position)
 
+    def _operating_state_cb(self, msg, psm_id):
+        """Store the latest /PSM*/operating_state (crtk OperatingState)."""
+        self.operating_state[psm_id] = {
+            'state': msg.state,
+            'is_homed': msg.is_homed,
+            'is_busy': msg.is_busy,
+        }
+
+    def _send_state_command(self, psm_id, command):
+        """Publish a crtk state_command ('enable'|'disable'|'home'|'pause'|'unpause')."""
+        msg = StringStamped()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.string = command
+        self.state_cmd_pub[psm_id].publish(msg)
+
+    def _ensure_ready(self, psm_id, timeout=5.0):
+        """
+        Make sure PSM `psm_id` is ENABLED and homed before we command it.
+
+        Toggling teleop on/off in the dVRK console (or a prior tracking-error
+        trip) can leave the arm in FAULT/DISABLED/PAUSED. Sending jaw or pose
+        commands then faults the gripper ("arm not ready"). Here we re-enable
+        (which clears a FAULT and re-powers the actuators) and, if needed,
+        unpause -- but we only 'home' when the arm reports it is not homed, so a
+        normal re-enable never triggers a homing motion.
+
+        Returns True if the arm ends up ENABLED (+homed), else False.
+        """
+        st = self.operating_state.get(psm_id)
+
+        # No state received (topic absent, e.g. sim, or QoS mismatch): do NOT
+        # block -- returning immediately keeps jaw/pose commands responsive.
+        # Warn only once per arm so we don't stall or spam every command.
+        if st is None:
+            if not self._warned_no_state.get(psm_id):
+                self.node.get_logger().warn(
+                    f"PSM{psm_id}: no operating_state received; state gating "
+                    f"disabled, commanding directly")
+                self._warned_no_state[psm_id] = True
+            return True
+
+        if st['state'] == 'ENABLED' and st['is_homed']:
+            return True
+
+        deadline = time.time() + timeout
+        self.node.get_logger().warn(
+            f"PSM{psm_id}: not ready (state={st['state']}, homed={st['is_homed']}); "
+            f"attempting to enable")
+
+        last_cmd = 0.0
+        while time.time() < deadline:
+            st = self.operating_state.get(psm_id)
+            if st is not None and st['state'] == 'ENABLED' and st['is_homed']:
+                self.node.get_logger().info(f"PSM{psm_id}: ready")
+                return True
+            # (re)issue the appropriate recovery command at ~2 Hz
+            now = time.time()
+            if now - last_cmd > 0.5 and st is not None:
+                if st['state'] in ('FAULT', 'DISABLED'):
+                    self._send_state_command(psm_id, 'enable')
+                elif st['state'] == 'PAUSED':
+                    self._send_state_command(psm_id, 'unpause')
+                elif st['state'] == 'ENABLED' and not st['is_homed']:
+                    self._send_state_command(psm_id, 'home')
+                last_cmd = now
+            time.sleep(0.05)
+
+        st = self.operating_state.get(psm_id)
+        self.node.get_logger().error(
+            f"PSM{psm_id}: still not ready after {timeout}s "
+            f"(state={st['state'] if st else None}); skipping command")
+        return False
+
     def _zero_roll_ref(self, psm_id):
         """
         Orientation of the gripper with the tool-roll joint at 0, computed from
@@ -360,7 +572,8 @@ class PSMControl():
                 "stdin is not a TTY; spacebar stop is disabled.")
             return
 
-        print("[keyboard] press SPACE to stop motion (waits for next message)")
+        print("[keyboard] SPACE = stop motion (waits for next message), "
+              "H = retract both grippers to home")
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         try:
@@ -374,19 +587,29 @@ class PSMControl():
                         self._stop_motion.set()
                         print("\n[STOP] space pressed - halting motion, "
                               "waiting for next message")
+                    elif ch in ('h', 'H'):
+                        # preempt any active motion so homing can grab the control
+                        # lock, then retract both arms in a background thread (so
+                        # this listener stays responsive to SPACE during homing).
+                        self._stop_motion.set()
+                        print("\n[HOME] h pressed - retracting both grippers")
+                        threading.Thread(target=self.home_all, daemon=True).start()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
     def control_PSM(self, psm, goal_pose_base_fee, pos_dist_th = 1e-3, angle_dist_th = 3 * np.pi / 180):
         # goal_pose_base_fee: (qw, qx, qy, qz, x, y, z), FEE pose in the PSM base frame
         self._stop_motion.clear()  # a new goal resumes motion after a space-stop
+        if not self._ensure_ready(psm):
+            self._publish_done(psm)  # can't move; don't leave the sim waiting
+            return
         self.controlPoseFeeInBase(psm,
                                   goal_pose_base_fee,
                                   pos_dist_th=pos_dist_th,
                                   angle_dist_th=angle_dist_th,
                                   )
 
-    def control_jaw(self, psm, degree, max_step_deg=0.5, sleep=0.005, stop_on_effort=False):
+    def control_jaw(self, psm, degree, max_step_deg=0.25, sleep=0.005, stop_on_effort=False):
         '''
         when psm is grasping needle, check jaw angle
         psm_1 open jaw angle 1.04703528
@@ -403,6 +626,9 @@ class PSMControl():
             print(f"degree goal is out of bound [-20 - 100], goal: {degree}")
             pdb.set_trace()
         self._stop_motion.clear()  # a new jaw goal resumes motion after a space-stop
+        if psm in [1, 2] and not self._ensure_ready(psm):
+            self._publish_done(psm)  # arm not ready (e.g. after teleop toggle)
+            return
         if psm in [1, 2]:
             if degree == 0:
                 degree = -9
@@ -477,6 +703,93 @@ class PSMControl():
         pub = self.done_pub_1 if psm_id == 1 else self.done_pub_2
         pub.publish(Bool(data=True))
 
+    # ------------------------------------------------------------------
+    # Joint-space homing ('h' key): retract both arms to RETRACTED_JS.
+    # ------------------------------------------------------------------
+    def home_all(self):
+        """Retract both PSMs to the retracted joint config, one arm at a time."""
+        if self._homing.is_set():
+            print("[home] already homing; ignoring")
+            return
+        self._homing.set()
+        try:
+            for psm in (1, 2):
+                self._home_arm(psm)
+            print("[home] both grippers retracted")
+        finally:
+            self._homing.clear()
+
+    def _home_arm(self, psm_id):
+        """
+        Drive one PSM to RETRACTED_JS via joint servo (servo_jp), stepping each
+        joint by at most HOME_JOINT_STEP per command. Serialized with all other
+        control actions by _control_lock; interruptible with SPACE.
+        """
+        with self._control_lock:
+            self._stop_motion.clear()  # this homing action resumes after a stop
+            if not self._ensure_ready(psm_id):
+                self.node.get_logger().error(
+                    f"PSM{psm_id}: not ready; skipping homing")
+                return
+            joints = self.psm1_joints if psm_id == 1 else self.psm2_joints
+            if joints is None or len(joints) < len(RETRACTED_JS):
+                self.node.get_logger().error(
+                    f"PSM{psm_id}: no measured_js yet; skipping homing")
+                return
+
+            # Open the jaw before retracting. jaw/servo_jp and the arm servo_jp
+            # below are both JOINT_SPACE, so this does NOT flip control spaces.
+            self._open_jaw_for_home(psm_id)
+            if self._stop_motion.is_set():
+                print(f"[STOP] homing PSM{psm_id} interrupted before retract")
+                return
+
+            start = np.asarray(joints[:len(RETRACTED_JS)], dtype=float)
+            target = RETRACTED_JS.astype(float)
+            delta = target - start
+            n_steps = int(max(np.ceil(np.max(np.abs(delta) / HOME_JOINT_STEP)), 1))
+            pub = self.set_arm_jp_pub[psm_id]
+            print(f"[home] PSM{psm_id} joint-space retract in {n_steps} steps")
+
+            # servo_jp puts the arm in JOINT_SPACE; do NOT interleave jaw commands
+            # (that would flip control spaces and fault the wrist).
+            for s in range(1, n_steps + 1):
+                if self._stop_motion.is_set():
+                    print(f"[STOP] homing PSM{psm_id} interrupted")
+                    return
+                q = start + delta * (s / n_steps)
+                self._publish_arm_jp(pub, q)
+                time.sleep(0.01)
+
+            # a big joint move invalidates the once-captured zero-roll reference;
+            # recompute it on the next Cartesian goal.
+            self.init_quat[psm_id] = None
+            self._publish_done(psm_id)
+            print(f"[home] PSM{psm_id} retracted")
+
+    def _open_jaw_for_home(self, psm_id, step_deg=0.5, sleep=0.005):
+        """
+        Smoothly open the jaw to OPEN_JAW_DEG before a retract. Steps in small
+        increments (like control_jaw) but does NOT publish /done -- the caller
+        finishes the retract first. Interruptible with SPACE.
+        """
+        cur_rad = self._latest_jaw(psm_id)
+        init_deg = (cur_rad * 180.0 / np.pi) if cur_rad is not None else 0.0
+        self.desired_jaw[psm_id] = OPEN_JAW_DEG  # hold this angle through the retract
+        n = max(int(np.ceil(abs(OPEN_JAW_DEG - init_deg) / step_deg)), 1)
+        print(f"[home] PSM{psm_id} opening jaw {init_deg:.1f} -> {OPEN_JAW_DEG:.1f} deg")
+        for step in np.linspace(init_deg, OPEN_JAW_DEG, n + 1)[1:]:
+            if self._stop_motion.is_set():
+                return
+            self.openGripperDegree(psm_id, degree=float(step), sleep=sleep)
+
+    def _publish_arm_jp(self, pub, positions):
+        """Publish a 6-joint arm servo_jp command (positions in rad / m)."""
+        msg = JointState()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.position = [float(x) for x in positions]
+        pub.publish(msg)
+
     # quat: wxyz
     def _publishPoseBaseFee(self, psm_id, set_ee_pub, pos, quat, sleep_time=0.01):
         msg = PoseStamped()
@@ -495,14 +808,147 @@ class PSMControl():
         set_ee_pub.publish(msg)
         time.sleep(sleep_time)
 
+    # ------------------------------------------------------------------
+    # Collision avoidance between the two arms.
+    #
+    # Both arms are expressed in the camera frame via the calibration
+    # (p_cam = H_cam_base_i @ p_base). Each arm is a capsule from its base
+    # origin (RCM) to its gripper tip. Because control actions are serialized
+    # by self._control_lock, only ONE arm moves at a time -- the other is a
+    # static obstacle -- so we can plan the moving arm's tip path (R^3 in its
+    # own base frame) around the other arm's shaft with a simple RRT.
+    # ------------------------------------------------------------------
+    def _H_cam_base(self, psm_id):
+        return self.H_cam_base_1 if psm_id == 1 else self.H_cam_base_2
+
+    def _base_to_cam(self, psm_id, p_base):
+        """Map a point from PSM `psm_id`'s base frame into the camera frame."""
+        p = np.asarray(p_base, float)
+        return (self._H_cam_base(psm_id) @ np.array([p[0], p[1], p[2], 1.0]))[:3]
+
+    def _base_origin_cam(self, psm_id):
+        """PSM base origin (RCM, proximal end of the shaft) in the camera frame."""
+        return self._H_cam_base(psm_id)[:3, 3].copy()
+
+    def _obstacle_shaft_cam(self, moving_psm_id):
+        """
+        The other (stationary) arm's shaft as a segment (B_o, T_o) in the camera
+        frame, using its latest measured tip. None if its pose isn't available.
+        """
+        other = 2 if moving_psm_id == 1 else 1
+        other_pose = self._latest_base_fee_pose(other)
+        if other_pose is None:
+            return None
+        B_o = self._base_origin_cam(other)
+        T_o = self._base_to_cam(other, np.asarray(other_pose[-3:], float))
+        return (B_o, T_o)
+
+    def _tip_clearance_ok(self, psm_id, tip_base, obstacle,
+                          shaft_min=SHAFT_CLEARANCE, tip_min=TIP_CLEARANCE):
+        """
+        True if placing PSM `psm_id`'s tip at `tip_base` (its base frame) keeps
+        both the shaft-shaft and tip-tip clearances against `obstacle`.
+        """
+        if obstacle is None:
+            return True
+        B_o, T_o = obstacle
+        B_a = self._base_origin_cam(psm_id)
+        T_a = self._base_to_cam(psm_id, tip_base)
+        if seg_seg_dist(B_a, T_a, B_o, T_o) < shaft_min:
+            return False
+        if np.linalg.norm(T_a - T_o) < tip_min:
+            return False
+        return True
+
+    def _edge_ok(self, psm_id, a_base, b_base, obstacle):
+        """Collision-free straight tip motion from a_base to b_base (discretized)."""
+        a = np.asarray(a_base, float)
+        b = np.asarray(b_base, float)
+        length = np.linalg.norm(b - a)
+        n = max(int(np.ceil(length / RRT_COLLISION_RES)), 1)
+        for i in range(n + 1):
+            if not self._tip_clearance_ok(psm_id, a + (b - a) * (i / n), obstacle):
+                return False
+        return True
+
+    def _plan_path(self, psm_id, start_base, goal_base, obstacle):
+        """
+        RRT in the moving arm's base frame (tip position). Returns a list of
+        waypoints [start, ..., goal] whose straight segments are all collision
+        free, or None if the goal is in collision / planning fails.
+        """
+        start = np.asarray(start_base, float)
+        goal = np.asarray(goal_base, float)
+
+        # Fast path: straight line already clear (also the no-obstacle case).
+        if self._edge_ok(psm_id, start, goal, obstacle):
+            return [start, goal]
+
+        if not self._tip_clearance_ok(psm_id, goal, obstacle):
+            self.node.get_logger().error(
+                f"PSM{psm_id}: goal pose collides with the other arm; not moving")
+            return None
+
+        lo = np.minimum(start, goal) - RRT_SAMPLE_MARGIN
+        hi = np.maximum(start, goal) + RRT_SAMPLE_MARGIN
+        nodes = [start]
+        parents = [-1]
+        for _ in range(RRT_MAX_ITERS):
+            sample = goal if self._rng.random() < RRT_GOAL_BIAS \
+                else lo + self._rng.random(3) * (hi - lo)
+            idx = int(np.argmin([np.linalg.norm(sample - nd) for nd in nodes]))
+            near = nodes[idx]
+            direction = sample - near
+            dn = np.linalg.norm(direction)
+            if dn < 1e-9:
+                continue
+            new = near + direction / dn * min(RRT_STEP, dn)
+            if not self._edge_ok(psm_id, near, new, obstacle):
+                continue
+            nodes.append(new)
+            parents.append(idx)
+            if np.linalg.norm(new - goal) < RRT_STEP and \
+                    self._edge_ok(psm_id, new, goal, obstacle):
+                nodes.append(goal)
+                parents.append(len(nodes) - 2)
+                path = self._backtrace(nodes, parents)
+                return self._shortcut(psm_id, path, obstacle)
+        self.node.get_logger().error(
+            f"PSM{psm_id}: RRT found no collision-free path in {RRT_MAX_ITERS} iters")
+        return None
+
+    def _backtrace(self, nodes, parents):
+        path = []
+        i = len(nodes) - 1
+        while i != -1:
+            path.append(nodes[i])
+            i = parents[i]
+        path.reverse()
+        return path
+
+    def _shortcut(self, psm_id, path, obstacle):
+        """Randomized shortcut smoothing: drop waypoints whose bypass stays free."""
+        path = [np.asarray(p, float) for p in path]
+        for _ in range(RRT_SHORTCUT_ITERS):
+            if len(path) <= 2:
+                break
+            i = int(self._rng.integers(0, len(path) - 1))
+            j = int(self._rng.integers(0, len(path) - 1))
+            a, b = min(i, j), max(i, j)
+            if b - a < 2:
+                continue
+            if self._edge_ok(psm_id, path[a], path[b], obstacle):
+                path = path[:a + 1] + path[b:]
+        return path
+
     def controlPoseFeeInBase(
         self,
         psm_id: int,
         goal_pose_base_fee: np.ndarray,
         pos_dist_th: float = 1e-4,
         angle_dist_th: float = 5 * np.pi / 180,
-        pos_step: float = 1e-3,
-        angle_step_deg: float = 2.0,
+        pos_step: float = 9e-4,
+        angle_step_deg: float = 1.0,
         sleep: float = 0.005,
         max_iters: int = 5000,
     ):
@@ -576,24 +1022,70 @@ class PSMControl():
             print(f"[goal check] PSM{psm_id} current base_fee pos: {np.asarray(cur[-3:])}, "
                   f"goal pos: {goal_pos}, offset: {goal_pos - np.asarray(cur[-3:], dtype=float)}")
 
-        # no-progress ("settled") detection: if the robot can't get any closer to
-        # the goal (steady-state tracking error below the thresholds), stop early
-        # instead of holding the control lock for all max_iters. This lets the
-        # next command (e.g. the gripper) run promptly.
+        # --- Plan a collision-free tip path around the other (stationary) arm ---
+        if cur is None:
+            self.node.get_logger().error(
+                f"PSM{psm_id}: no measured pose yet; cannot plan, skipping move")
+            self._publish_done(psm_id)
+            return
+        start_pos = np.asarray(cur[-3:], dtype=float)
+        start_quat = np.asarray(cur[:4], dtype=float)
+
+        obstacle = self._obstacle_shaft_cam(psm_id)  # other arm's shaft (snapshot)
+        path = self._plan_path(psm_id, start_pos, goal_pos, obstacle)
+        if path is None:
+            # goal in collision or no path found -> hold, but let the sim advance
+            self._publish_done(psm_id)
+            return
+        if len(path) > 2:
+            print(f"[plan] PSM{psm_id} routing around other arm: {len(path)} waypoints")
+
+        # --- Follow the waypoints; interpolate orientation by cumulative arc len ---
+        seglen = [np.linalg.norm(path[k + 1] - path[k]) for k in range(len(path) - 1)]
+        total = sum(seglen) or 1.0
+        cum = 0.0
+        for k in range(1, len(path)):
+            cum += seglen[k - 1]
+            frac = cum / total
+            target_quat = slerp_frac(start_quat, goal_quat, frac)
+            is_final = (k == len(path) - 1)
+            status = self._servo_to_target(
+                psm_id, set_ee_pub, np.asarray(path[k], float), target_quat,
+                pos_dist_th=pos_dist_th if is_final else WAYPOINT_POS_TH,
+                angle_dist_th=angle_dist_th if is_final else WAYPOINT_ANG_TH,
+                pos_step=pos_step, angle_step_deg=angle_step_deg, sleep=sleep,
+                max_iters=max_iters if is_final else 2000, settle_iters=400,
+            )
+            if status == 'stopped':
+                return  # space pressed -> hold; next message resumes (no done)
+            if status == 'aborted':
+                # live collision guard tripped -> hold here, but tell the sim
+                self._publish_done(psm_id)
+                return
+
+        # reached goal / settled / max-iters -> the move is done, tell the sim.
+        self._publish_done(psm_id)
+
+    def _servo_to_target(self, psm_id, set_ee_pub, target_pos, target_quat,
+                         pos_dist_th, angle_dist_th, pos_step, angle_step_deg,
+                         sleep, max_iters, settle_iters):
+        """
+        Closed-loop servo of one FEE target (position + quat, base frame). Steps a
+        small bounded amount each iteration from the LIVE measured pose so every
+        servo_cp command stays close to the current pose (no PID tracking fault),
+        and re-checks clearance to the other arm live (guards against it moving).
+
+        Returns: 'reached' | 'settled' | 'maxiters' | 'stopped' | 'aborted'.
+        Does NOT publish /done or touch the jaw -- the caller owns those.
+        """
         best_pos_dist = np.inf
         best_angle_dist = np.inf
         no_improve = 0
-        settle_iters = 400  # ~2 s at sleep=5 ms with no improvement -> give up
-
         for _ in range(max_iters):
-            # 0. Space pressed -> abort; stop publishing so the robot holds its
-            #    last commanded pose, and wait for the next goal message.
             if self._stop_motion.is_set():
                 print("[STOP] motion interrupted; waiting for next message")
-                return
+                return 'stopped'
 
-            # 1. Re-read the LIVE base->FEE pose from measured_cp (closed-loop).
-            #    self.pose_base_fee* is kept fresh by the sensor callback thread.
             try:
                 cur = self._latest_base_fee_pose(psm_id)
                 current_pos = np.asarray(cur[-3:], dtype=float)
@@ -603,16 +1095,11 @@ class PSMControl():
                 time.sleep(sleep)
                 continue
 
-            # 2. Distance from the current pose to the goal
-            pos_dist = np.linalg.norm(goal_pos - current_pos)
-            angle_dist, _ = angleDist(current_quat, goal_quat)
-
+            pos_dist = np.linalg.norm(target_pos - current_pos)
+            angle_dist, _ = angleDist(current_quat, target_quat)
             if pos_dist < pos_dist_th and angle_dist < angle_dist_th:
-                break
+                return 'reached'
 
-            # 2b. Track best-so-far; if neither distance improves for a while the
-            #     arm has settled as close as it can get -> stop and move on.
-            #     Tolerances are above sensor noise so noise doesn't reset it.
             if pos_dist < best_pos_dist - 5e-5 or angle_dist < best_angle_dist - 5e-4:
                 best_pos_dist = min(best_pos_dist, pos_dist)
                 best_angle_dist = min(best_angle_dist, angle_dist)
@@ -621,46 +1108,43 @@ class PSMControl():
                 no_improve += 1
                 if no_improve >= settle_iters:
                     print(f"[settled] PSM{psm_id} no further progress "
-                          f"(pos_dist={pos_dist:.4f} m, angle_dist={angle_dist:.4f} rad); "
-                          f"moving on")
-                    break
+                          f"(pos_dist={pos_dist:.4f} m, angle_dist={angle_dist:.4f} rad)")
+                    return 'settled'
 
-            # 3. Take one small step toward the goal from the live current pose
             if pos_dist > 1e-9:
                 next_pos = current_pos + \
-                    (goal_pos - current_pos) * min(pos_step, pos_dist) / pos_dist
+                    (target_pos - current_pos) * min(pos_step, pos_dist) / pos_dist
             else:
                 next_pos = current_pos
-            # skip slerp when already aligned (avoids a 0/0 NaN in slerp)
-            if angle_dist > 1e-6:
-                next_quat = slerp(current_quat, goal_quat, max_move_angle=angle_step_deg)
-            else:
-                next_quat = current_quat
+            next_quat = slerp(current_quat, target_quat, max_move_angle=angle_step_deg) \
+                if angle_dist > 1e-6 else current_quat
 
-            # 4. Publish the base->FEE command directly to servo_cp.
-            #    The jaw was commanded once before the loop; do NOT re-send
-            #    jaw/servo_jp here -- doing so flips the arm into JOINT_SPACE and
-            #    back to CARTESIAN_SPACE every iteration, which faults the wrist.
+            # live safety guard: the planned path assumed a static obstacle; if the
+            # other arm has moved into our way, refuse the step and hold.
+            obstacle = self._obstacle_shaft_cam(psm_id)
+            if obstacle is not None:
+                B_o, T_o = obstacle
+                B_a = self._base_origin_cam(psm_id)
+                T_a = self._base_to_cam(psm_id, next_pos)
+                if (seg_seg_dist(B_a, T_a, B_o, T_o) < SHAFT_HARD_MIN or
+                        np.linalg.norm(T_a - T_o) < SHAFT_HARD_MIN):
+                    self.node.get_logger().error(
+                        f"PSM{psm_id}: live collision guard tripped; holding pose")
+                    return 'aborted'
+
             self._publishPoseBaseFee(
-                psm_id=psm_id,
-                set_ee_pub=set_ee_pub,
-                pos=next_pos,
-                quat=next_quat,
-                sleep_time=sleep,
+                psm_id=psm_id, set_ee_pub=set_ee_pub,
+                pos=next_pos, quat=next_quat, sleep_time=sleep,
             )
-        else:
-            print("max iters reached")
-
-        # reached here on goal-reached, settle, or max-iters (NOT on a space stop,
-        # which returns early) -> the move is done, tell the sim.
-        self._publish_done(psm_id)
+        print("max iters reached")
+        return 'maxiters'
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # parser.add_argument('--speedy',           action="store_true")
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
-        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration.npz")
+        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
     args = parser.parse_args()
 
     rclpy.init(args=None)
