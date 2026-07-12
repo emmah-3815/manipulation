@@ -1,0 +1,48 @@
+%YAML:1.0
+---
+K1: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1.02588223e+03,  0.0,  1.67919017e+02,
+       0.0, 1.02588223e+03, 2.34152707e+02,
+       0., 0., 1. ]
+K2: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1.02588223e+03,  0.0,  1.67919017e+02,
+       0.0, 1.02588223e+03, 2.34152707e+02,
+       0., 0., 1. ]
+D1: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ 0., 0.,
+       0., 0.,
+       0. ]
+D2: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ 0., 0.,
+       0., 0.,
+       0. ]
+ImageSize: !!opencv-matrix # [ 480, 640 ]   #### florian's version was 680
+   rows: 1
+   cols: 2
+   dt: d
+   data: [ 480., 640. ]
+T: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ -6.820275085, 0., 0. ] ## mm, where left camera is with respect to right camera
+R: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0.,
+       0., 1., 0.,
+       0., 0., 1. ]
+

@@ -1,7 +1,32 @@
+import os
+import sys
+
+# ---------------------------------------------------------------------------
+# Source the dVRK ROS overlay (crtk_msgs, etc.) up front. Launching this with a
+# plain `python psm_control_constraints.py` from a shell that only has base ROS
+# sourced fails to import crtk_msgs. We can't just extend sys.path: the rosidl
+# C-extension .so files need LD_LIBRARY_PATH / AMENT_PREFIX_PATH, which the
+# dynamic loader reads at process start. So re-exec this process through bash
+# with the overlay sourced, then continue. Edit _ROS_OVERLAY for your setup.
+# ---------------------------------------------------------------------------
+_ROS_OVERLAY = "/home/arclab/ct_ws/install/setup.bash"
+if os.environ.get("_PSM_ENV_SOURCED") != "1":
+    _base = "/opt/ros/humble/setup.bash"
+    for _p in (_base, _ROS_OVERLAY):
+        if not os.path.exists(_p):
+            sys.exit(f"[bootstrap] setup file not found: {_p} "
+                     f"(edit _ROS_OVERLAY at the top of this script)")
+    os.environ["_PSM_ENV_SOURCED"] = "1"  # guard against a re-exec loop
+    os.execvp("bash", [
+        "bash", "-c",
+        'source "$1" && source "$2" && shift 2 && exec "$@"',
+        "bash", _base, _ROS_OVERLAY,
+        sys.executable, os.path.abspath(__file__), *sys.argv[1:],
+    ])
+
 import argparse
 import time
 import threading
-import sys
 import termios
 import tty
 import select
@@ -16,13 +41,14 @@ from pathlib import Path
 import pdb
 from scipy.spatial.transform import Rotation as R
 import numpy as np
-import os
 import transforms3d.quaternions as quaternions
 
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
+# crtk_msgs powers the operating-state gating / FAULT recovery (e.g. after a
+# teleop toggle). The overlay providing it is sourced by the bootstrap above.
 from crtk_msgs.msg import OperatingState, StringStamped
 
 # os.environ['ROS_DOMAIN_ID'] = '111'
@@ -97,6 +123,8 @@ WAYPOINT_ANG_TH = 10 * np.pi / 180
 RETRACTED_JS = np.array([-0.7, 0.00, 0.06, 0.0, 0.0, 0.0])
 # jaw angle (deg) to open to before retracting, so the tool withdraws open.
 OPEN_JAW_DEG = 40.0
+# the jaw moves this many times slower while closed (angle < 0 deg) than open.
+JAW_CLOSED_SLOW_FACTOR = 5.0
 # max increment per published command, per joint (rad for revolute, m for insertion).
 # Smaller -> more steps at the same publish cadence -> slower, smoother homing.
 HOME_JOINT_STEP = np.array([0.002, 0.002, 0.00010, 0.002, 0.002, 0.002])
@@ -636,10 +664,13 @@ class PSMControl():
             self.desired_jaw[psm] = degree
             rad = self.psm1_current_jaw if psm==1 else self.psm2_current_jaw # get the current state of the robot
             init_degree = rad / np.pi * 180 # convert from rad to degree
-            # subdivide into steps of at most max_step_deg degrees
-            n_steps = max(int(np.ceil(abs(degree - init_degree) / max_step_deg)), 1)
-            interp = np.linspace(init_degree, degree, n_steps + 1)[1:]  # skip current angle
-            for step in interp:
+            # March from the current angle to the goal. The per-command step is
+            # max_step_deg while the jaw is open (>= 0 deg) and JAW_CLOSED_SLOW_FACTOR
+            # times smaller while it is closed (< 0 deg), so motion through the
+            # closed range is that many times slower.
+            direction = 1.0 if degree >= init_degree else -1.0
+            pos = init_degree
+            while abs(pos - degree) > 1e-9:
                 if self._stop_motion.is_set():  # space pressed -> abort jaw motion
                     print("[STOP] jaw motion interrupted; waiting for next message")
                     return
@@ -650,7 +681,11 @@ class PSMControl():
                     if self.jaw_effort['psm_{}'.format(psm)] < high_effort:
                         print(f"Jaw stuck? Jaw effort: {self.jaw_effort['psm_{}'.format(psm)]}")
                         break
-                self.openGripperDegree(psm, degree=float(step), sleep=sleep)
+                step = max_step_deg / JAW_CLOSED_SLOW_FACTOR if pos < 0.0 else max_step_deg
+                pos += direction * step
+                if (direction > 0 and pos > degree) or (direction < 0 and pos < degree):
+                    pos = degree  # clamp to the goal, don't overshoot
+                self.openGripperDegree(psm, degree=float(pos), sleep=sleep)
             # jaw move finished (reached target or effort-stopped, NOT space-stop
             # which returns early) -> tell the sim it can send the next step
             self._publish_done(psm)
@@ -1144,7 +1179,7 @@ if __name__ == "__main__":
     # parser.add_argument('--speedy',           action="store_true")
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
-        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
+        default=os.path.dirname(__file__) + "/assets/psm_calibration_servo.npz")
     args = parser.parse_args()
 
     rclpy.init(args=None)
