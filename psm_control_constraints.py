@@ -25,6 +25,7 @@ if os.environ.get("_PSM_ENV_SOURCED") != "1":
     ])
 
 import argparse
+import atexit
 import time
 import threading
 import termios
@@ -50,6 +51,9 @@ from std_msgs.msg import Bool
 # crtk_msgs powers the operating-state gating / FAULT recovery (e.g. after a
 # teleop toggle). The overlay providing it is sourced by the bootstrap above.
 from crtk_msgs.msg import OperatingState, StringStamped
+# PsmState (header + int32 psm_id): published on /manipulate/psm to announce
+# which PSM (1 or 2) most recently closed its jaws.
+from thread_reconstruction_msgs.msg import PsmState
 
 # os.environ['ROS_DOMAIN_ID'] = '111'
 
@@ -125,6 +129,10 @@ RETRACTED_JS = np.array([-0.7, 0.00, 0.06, 0.0, 0.0, 0.0])
 OPEN_JAW_DEG = 40.0
 # the jaw moves this many times slower while closed (angle < 0 deg) than open.
 JAW_CLOSED_SLOW_FACTOR = 5.0
+# the arm servos this many times slower while its jaw is closed (below
+# PSM_CLOSED_JAW_DEG), e.g. while grasping, for finer control.
+PSM_CLOSED_JAW_DEG = 4.0
+PSM_CLOSED_SLOW_FACTOR = 2.0
 # max increment per published command, per joint (rad for revolute, m for insertion).
 # Smaller -> more steps at the same publish cadence -> slower, smoother homing.
 HOME_JOINT_STEP = np.array([0.002, 0.002, 0.00010, 0.002, 0.002, 0.002])
@@ -226,6 +234,15 @@ class PSMControl():
         # set while a homing/retract ('h' key) sequence is running, so repeated
         # presses don't stack multiple homing threads.
         self._homing = threading.Event()
+
+        # saved terminal attributes so we can always restore cooked/echo mode on
+        # exit. keyboard_listener puts the tty in cbreak (no echo); its own
+        # finally does not run because it lives in a daemon thread that is killed
+        # at shutdown -> without this the terminal is left with echo OFF (typed
+        # text invisible). Restored via atexit and the main finally.
+        self._term_fd = None
+        self._term_old_attrs = None
+        atexit.register(self._restore_terminal)
         # seeded RNG for the RRT planner (reproducible paths).
         self._rng = np.random.default_rng(0)
 
@@ -239,10 +256,17 @@ class PSMControl():
         # gated by this, so measured_cp keeps updating for closed-loop control.
         self._control_lock = threading.Lock()
 
-        # set by the keyboard listener when space is pressed: aborts the current
-        # motion (robot holds its last commanded pose). Cleared when the next
-        # goal/jaw message starts being processed.
-        self._stop_motion = threading.Event()
+        # latching PAUSE toggle. Space sets it (pause) and space clears it
+        # (resume). While paused, the active motion parks in place (robot holds
+        # its last commanded pose) and every incoming goal/jaw call blocks at its
+        # entry, so no control call is processed until space is pressed again.
+        self._paused = threading.Event()
+
+        # transient preempt, set by the 'h' homing key: aborts the current motion
+        # (returns without /done) so the homing routine can take the control lock.
+        # Homing clears it when it starts. Separate from _paused so homing is not
+        # itself blocked by the pause.
+        self._preempt = threading.Event()
 
         self.init_cam2base(args)
         self.pose_init = False # set to true when messages arrive
@@ -266,6 +290,14 @@ class PSMControl():
         psm2_pose_sub.registerCallback(lambda msg: _track_stamp('psm2', msg))
         psm1_jaw_sub.registerCallback(lambda msg: _track_stamp('psm1_jaw', msg))
         psm2_jaw_sub.registerCallback(lambda msg: _track_stamp('psm2_jaw', msg))
+
+        # Update each arm's live base->FEE pose DIRECTLY from its own measured_cp,
+        # independent of the 4-way synchronizer below. The closed-loop servo needs
+        # a fresh pose every few ms; if it relied only on synced_callback, a stall
+        # on ANY of the 4 synced topics (the other arm's pose or either jaw) would
+        # freeze this pose and the servo would settle in place without moving.
+        psm1_pose_sub.registerCallback(lambda msg: self._pose_cb(msg, 1))
+        psm2_pose_sub.registerCallback(lambda msg: self._pose_cb(msg, 2))
         # ---------------------------
         sync_targets = [psm1_pose_sub, psm2_pose_sub, psm1_jaw_sub, psm2_jaw_sub]
 
@@ -331,6 +363,9 @@ class PSMControl():
         self.done_pub_1 = self.node.create_publisher(Bool, '/PSM1/done', 10)
         self.done_pub_2 = self.node.create_publisher(Bool, '/PSM2/done', 10)
 
+        # announces which PSM (psm_id 1 or 2) most recently closed its jaws.
+        self.psm_state_pub = self.node.create_publisher(PsmState, '/manipulate/psm', 10)
+
         # joint states, for the tool-roll joint used to compute the zero-roll ref
         self.node.create_subscription(
             JointState, '/PSM1/measured_js', lambda m: self._joint_cb(m, 1), 10)
@@ -385,11 +420,23 @@ class PSMControl():
         self.H_cam_base_1_inv = np.linalg.inv(self.H_cam_base_1)
         self.H_cam_base_2_inv = np.linalg.inv(self.H_cam_base_2)
 
-    def synced_callback(self, psm1_pose_msg, psm2_pose_msg, psm1_jaw_msg, psm2_jaw_msg):
-        # measured_cp is base->FEE (same frame/convention as /PSM*/goal)
-        self.pose_base_fee1 = self._measured_cp_to_posquat(psm1_pose_msg)
-        self.pose_base_fee2 = self._measured_cp_to_posquat(psm2_pose_msg)
+    def _pose_cb(self, pose_msg, psm_id):
+        """
+        Update one arm's live base->FEE pose from its OWN /PSM*/measured_cp,
+        independent of the 4-way synchronizer. This is the pose the closed-loop
+        servo reads, so it must stay fresh even if a synced topic stalls.
+        """
+        pq = self._measured_cp_to_posquat(pose_msg)
+        if psm_id == 1:
+            self.pose_base_fee1 = pq
+        else:
+            self.pose_base_fee2 = pq
+        self.pose_init = True
 
+    def synced_callback(self, psm1_pose_msg, psm2_pose_msg, psm1_jaw_msg, psm2_jaw_msg):
+        # NOTE: the live base->FEE poses are updated in _pose_cb (per-arm, direct
+        # from measured_cp) so the servo never starves on a synced-topic stall.
+        # This callback only maintains the synchronized jaw state / effort.
         self.psm1_current_jaw = psm1_jaw_msg.position[0]  # radians
         self.psm2_current_jaw = psm2_jaw_msg.position[0]  # radians
 
@@ -397,15 +444,12 @@ class PSMControl():
         self.jaw_effort['psm_1'] = psm1_jaw_msg.effort[0] if len(psm1_jaw_msg.effort) > 0 else None
         self.jaw_effort['psm_2'] = psm2_jaw_msg.effort[0] if len(psm2_jaw_msg.effort) > 0 else None
 
-        if not self.pose_init:
-            self.node.get_logger().info("Received first synced psm poses...")
-            self.pose_init = True
-
     def psm1_goal_callback(self, psm1_pose_msg):
         pos = psm1_pose_msg.pose.position
         ori = psm1_pose_msg.pose.orientation
         # goal in PSM base frame, base->FEE: (qw, qx, qy, qz, x, y, z)
         pose = np.array([ori.w, ori.x, ori.y, ori.z, pos.x, pos.y, pos.z])
+        self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_PSM(psm=1, goal_pose_base_fee=pose)
 
@@ -414,20 +458,32 @@ class PSMControl():
         ori = psm2_pose_msg.pose.orientation
         # goal in PSM base frame, base->FEE: (qw, qx, qy, qz, x, y, z)
         pose = np.array([ori.w, ori.x, ori.y, ori.z, pos.x, pos.y, pos.z])
+        self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_PSM(psm=2, goal_pose_base_fee=pose)
 
     def psm1_jaw_callback(self, psm1_jaw_msg):
         rad = psm1_jaw_msg.position[0]
         degree = rad / np.pi * 180
+        self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_jaw(psm=1, degree=degree, stop_on_effort=True)
 
     def psm2_jaw_callback(self, psm2_jaw_msg):
         rad = psm2_jaw_msg.position[0]
         degree = rad / np.pi * 180
+        self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_jaw(psm=2, degree=degree, stop_on_effort=True)
+
+    def _wait_if_paused(self):
+        """
+        Block while SPACE has paused the node so the robot holds its pose and no
+        control call proceeds. Returns early if a homing preempt ('h') is
+        requested (homing must not be blocked by the pause) or on shutdown.
+        """
+        while self._paused.is_set() and not self._preempt.is_set() and rclpy.ok():
+            time.sleep(0.05)
 
     def _pose_to_matrix(self, pose):
         t = pose[:3]
@@ -590,20 +646,24 @@ class PSMControl():
 
     def keyboard_listener(self):
         """
-        Read single keypresses from the terminal. Pressing SPACE aborts the
-        current motion (the control loops check self._stop_motion and stop, so
-        the robot holds its last commanded pose); the stop clears automatically
-        when the next goal/jaw message starts processing. Runs in its own thread.
+        Read single keypresses from the terminal. SPACE toggles PAUSE: the first
+        press pauses (the active motion parks and holds its pose, and every
+        incoming goal/jaw call blocks until resumed); the next press resumes.
+        H retracts both grippers to home. Runs in its own thread.
         """
         if not sys.stdin.isatty():
             self.node.get_logger().warn(
-                "stdin is not a TTY; spacebar stop is disabled.")
+                "stdin is not a TTY; spacebar pause is disabled.")
             return
 
-        print("[keyboard] SPACE = stop motion (waits for next message), "
+        print("[keyboard] SPACE = pause/resume (toggle), "
               "H = retract both grippers to home")
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
+        # record for _restore_terminal (atexit / main finally), since this
+        # daemon thread's finally may not run at shutdown.
+        self._term_fd = fd
+        self._term_old_attrs = old_attrs
         try:
             tty.setcbreak(fd)  # read keys without waiting for Enter
             while rclpy.ok():
@@ -612,22 +672,40 @@ class PSMControl():
                 if r:
                     ch = sys.stdin.read(1)
                     if ch == ' ':
-                        self._stop_motion.set()
-                        print("\n[STOP] space pressed - halting motion, "
-                              "waiting for next message")
+                        if self._paused.is_set():
+                            self._paused.clear()
+                            print("\n[RESUME] space pressed - resuming; "
+                                  "control calls will be processed again")
+                        else:
+                            self._paused.set()
+                            print("\n[PAUSE] space pressed - paused; holding pose "
+                                  "and ignoring all calls until space is pressed")
                     elif ch in ('h', 'H'):
-                        # preempt any active motion so homing can grab the control
-                        # lock, then retract both arms in a background thread (so
-                        # this listener stays responsive to SPACE during homing).
-                        self._stop_motion.set()
+                        # homing overrides a pause: clear it so homing isn't
+                        # blocked, preempt any active motion so homing can grab the
+                        # control lock, then retract both arms in a background
+                        # thread (so this listener stays responsive during homing).
+                        self._paused.clear()
+                        self._preempt.set()
                         print("\n[HOME] h pressed - retracting both grippers")
                         threading.Thread(target=self.home_all, daemon=True).start()
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            self._restore_terminal()
+
+    def _restore_terminal(self):
+        """Restore the terminal to its original (cooked/echo) mode. Safe to call
+        multiple times; runs from the listener's finally, atexit, and the main
+        finally so a daemon-thread shutdown never leaves the tty with echo off."""
+        if self._term_old_attrs is not None and self._term_fd is not None:
+            try:
+                termios.tcsetattr(self._term_fd, termios.TCSADRAIN,
+                                  self._term_old_attrs)
+            except Exception:
+                pass
+            self._term_old_attrs = None  # restored; don't do it again
 
     def control_PSM(self, psm, goal_pose_base_fee, pos_dist_th = 1e-3, angle_dist_th = 3 * np.pi / 180):
         # goal_pose_base_fee: (qw, qx, qy, qz, x, y, z), FEE pose in the PSM base frame
-        self._stop_motion.clear()  # a new goal resumes motion after a space-stop
         if not self._ensure_ready(psm):
             self._publish_done(psm)  # can't move; don't leave the sim waiting
             return
@@ -653,7 +731,6 @@ class PSMControl():
         if not (-20 <= degree <= 90):
             print(f"degree goal is out of bound [-20 - 100], goal: {degree}")
             pdb.set_trace()
-        self._stop_motion.clear()  # a new jaw goal resumes motion after a space-stop
         if psm in [1, 2] and not self._ensure_ready(psm):
             self._publish_done(psm)  # arm not ready (e.g. after teleop toggle)
             return
@@ -671,8 +748,9 @@ class PSMControl():
             direction = 1.0 if degree >= init_degree else -1.0
             pos = init_degree
             while abs(pos - degree) > 1e-9:
-                if self._stop_motion.is_set():  # space pressed -> abort jaw motion
-                    print("[STOP] jaw motion interrupted; waiting for next message")
+                self._wait_if_paused()  # SPACE pause: hold here, resume in place
+                if self._preempt.is_set():  # 'h' homing -> abort jaw motion
+                    print("[HOME] jaw motion preempted for homing")
                     return
                 # optional stuck detection (threshold unverified -> off by default,
                 # so the jaw always drives all the way to the commanded angle)
@@ -686,6 +764,10 @@ class PSMControl():
                 if (direction > 0 and pos > degree) or (direction < 0 and pos < degree):
                     pos = degree  # clamp to the goal, don't overshoot
                 self.openGripperDegree(psm, degree=float(pos), sleep=sleep)
+            # a jaw CLOSE (commanded to < 0 deg) just completed -> announce which
+            # PSM most recently closed its jaws on /manipulate/psm.
+            if degree < 0:
+                self._publish_psm_state(psm)
             # jaw move finished (reached target or effort-stopped, NOT space-stop
             # which returns early) -> tell the sim it can send the next step
             self._publish_done(psm)
@@ -738,6 +820,14 @@ class PSMControl():
         pub = self.done_pub_1 if psm_id == 1 else self.done_pub_2
         pub.publish(Bool(data=True))
 
+    def _publish_psm_state(self, psm_id):
+        """Announce on /manipulate/psm which PSM (1 or 2) last closed its jaws."""
+        msg = PsmState()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = f'PSM{psm_id}'
+        msg.psm_id = int(psm_id)
+        self.psm_state_pub.publish(msg)
+
     # ------------------------------------------------------------------
     # Joint-space homing ('h' key): retract both arms to RETRACTED_JS.
     # ------------------------------------------------------------------
@@ -761,7 +851,7 @@ class PSMControl():
         control actions by _control_lock; interruptible with SPACE.
         """
         with self._control_lock:
-            self._stop_motion.clear()  # this homing action resumes after a stop
+            self._preempt.clear()  # consume the 'h' preempt; this homing run owns it
             if not self._ensure_ready(psm_id):
                 self.node.get_logger().error(
                     f"PSM{psm_id}: not ready; skipping homing")
@@ -775,8 +865,8 @@ class PSMControl():
             # Open the jaw before retracting. jaw/servo_jp and the arm servo_jp
             # below are both JOINT_SPACE, so this does NOT flip control spaces.
             self._open_jaw_for_home(psm_id)
-            if self._stop_motion.is_set():
-                print(f"[STOP] homing PSM{psm_id} interrupted before retract")
+            if self._preempt.is_set():
+                print(f"[HOME] homing PSM{psm_id} preempted before retract")
                 return
 
             start = np.asarray(joints[:len(RETRACTED_JS)], dtype=float)
@@ -789,8 +879,9 @@ class PSMControl():
             # servo_jp puts the arm in JOINT_SPACE; do NOT interleave jaw commands
             # (that would flip control spaces and fault the wrist).
             for s in range(1, n_steps + 1):
-                if self._stop_motion.is_set():
-                    print(f"[STOP] homing PSM{psm_id} interrupted")
+                self._wait_if_paused()  # SPACE pause: hold mid-retract, then resume
+                if self._preempt.is_set():
+                    print(f"[HOME] homing PSM{psm_id} preempted")
                     return
                 q = start + delta * (s / n_steps)
                 self._publish_arm_jp(pub, q)
@@ -814,7 +905,8 @@ class PSMControl():
         n = max(int(np.ceil(abs(OPEN_JAW_DEG - init_deg) / step_deg)), 1)
         print(f"[home] PSM{psm_id} opening jaw {init_deg:.1f} -> {OPEN_JAW_DEG:.1f} deg")
         for step in np.linspace(init_deg, OPEN_JAW_DEG, n + 1)[1:]:
-            if self._stop_motion.is_set():
+            self._wait_if_paused()  # SPACE pause: hold mid jaw-open, then resume
+            if self._preempt.is_set():
                 return
             self.openGripperDegree(psm_id, degree=float(step), sleep=sleep)
 
@@ -1092,7 +1184,7 @@ class PSMControl():
                 max_iters=max_iters if is_final else 2000, settle_iters=400,
             )
             if status == 'stopped':
-                return  # space pressed -> hold; next message resumes (no done)
+                return  # 'h' homing preempt -> hold here, no done (homing owns it)
             if status == 'aborted':
                 # live collision guard tripped -> hold here, but tell the sim
                 self._publish_done(psm_id)
@@ -1116,9 +1208,11 @@ class PSMControl():
         best_pos_dist = np.inf
         best_angle_dist = np.inf
         no_improve = 0
+        start_meas_pos = None  # first measured pos, to report how far we actually moved
         for _ in range(max_iters):
-            if self._stop_motion.is_set():
-                print("[STOP] motion interrupted; waiting for next message")
+            self._wait_if_paused()  # SPACE pause: hold pose here, resume in place
+            if self._preempt.is_set():  # 'h' homing -> abort so homing takes over
+                print("[HOME] motion preempted for homing")
                 return 'stopped'
 
             try:
@@ -1130,28 +1224,53 @@ class PSMControl():
                 time.sleep(sleep)
                 continue
 
+            if start_meas_pos is None:
+                start_meas_pos = current_pos.copy()
+
             pos_dist = np.linalg.norm(target_pos - current_pos)
             angle_dist, _ = angleDist(current_quat, target_quat)
             if pos_dist < pos_dist_th and angle_dist < angle_dist_th:
                 return 'reached'
 
-            if pos_dist < best_pos_dist - 5e-5 or angle_dist < best_angle_dist - 5e-4:
+            # move the arm 2x slower while its jaw is closed (< PSM_CLOSED_JAW_DEG)
+            # -> smaller per-command increments at the same cadence.
+            jaw_rad = self._latest_jaw(psm_id)
+            jaw_closed = (jaw_rad is not None and
+                          jaw_rad * 180.0 / np.pi < PSM_CLOSED_JAW_DEG)
+            step_scale = 1.0 / PSM_CLOSED_SLOW_FACTOR if jaw_closed else 1.0
+            eff_pos_step = pos_step * step_scale
+            eff_angle_step = angle_step_deg * step_scale
+
+            # scale the min-progress ("settled") thresholds with the step size:
+            # slower motion makes less progress per iteration, so a fixed
+            # threshold would falsely read as "no progress" and stop early.
+            pos_improve_th = 5e-5 * step_scale
+            angle_improve_th = 5e-4 * step_scale
+            if (pos_dist < best_pos_dist - pos_improve_th or
+                    angle_dist < best_angle_dist - angle_improve_th):
                 best_pos_dist = min(best_pos_dist, pos_dist)
                 best_angle_dist = min(best_angle_dist, angle_dist)
                 no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= settle_iters:
+                    moved = float(np.linalg.norm(current_pos - start_meas_pos))
                     print(f"[settled] PSM{psm_id} no further progress "
-                          f"(pos_dist={pos_dist:.4f} m, angle_dist={angle_dist:.4f} rad)")
+                          f"(pos_dist={pos_dist:.4f} m, angle_dist={angle_dist:.4f} rad); "
+                          f"measured moved {moved*1000:.1f} mm this move")
+                    if moved < 1e-3:
+                        self.node.get_logger().warn(
+                            f"PSM{psm_id}: commanded servo_cp but the arm barely "
+                            f"moved ({moved*1000:.1f} mm) -- not tracking (fault / "
+                            f"wrong control space / joint limit) or measured_cp stale")
                     return 'settled'
 
             if pos_dist > 1e-9:
                 next_pos = current_pos + \
-                    (target_pos - current_pos) * min(pos_step, pos_dist) / pos_dist
+                    (target_pos - current_pos) * min(eff_pos_step, pos_dist) / pos_dist
             else:
                 next_pos = current_pos
-            next_quat = slerp(current_quat, target_quat, max_move_angle=angle_step_deg) \
+            next_quat = slerp(current_quat, target_quat, max_move_angle=eff_angle_step) \
                 if angle_dist > 1e-6 else current_quat
 
             # live safety guard: the planned path assumed a static obstacle; if the
@@ -1179,7 +1298,7 @@ if __name__ == "__main__":
     # parser.add_argument('--speedy',           action="store_true")
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
-        default=os.path.dirname(__file__) + "/assets/psm_calibration_servo.npz")
+        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
     args = parser.parse_args()
 
     rclpy.init(args=None)
@@ -1193,7 +1312,7 @@ if __name__ == "__main__":
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
-    # keyboard listener: SPACE stops the current motion until the next message
+    # keyboard listener: SPACE toggles pause/resume; H retracts both grippers
     kb_thread = threading.Thread(target=move.keyboard_listener, daemon=True)
     kb_thread.start()
 
@@ -1211,6 +1330,7 @@ if __name__ == "__main__":
         move.node.get_logger().info("Keyboard interrupt detected. Shutting down processor...")
     finally:
         # Clean up resources safely
+        move._restore_terminal()  # deterministic tty restore on Ctrl-C / exit
         executor.shutdown()
         move.node.destroy_node()
         if rclpy.ok():
