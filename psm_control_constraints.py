@@ -120,12 +120,10 @@ RRT_SHORTCUT_ITERS = 150  # path-smoothing attempts
 WAYPOINT_POS_TH = 3e-3
 WAYPOINT_ANG_TH = 10 * np.pi / 180
 
-# --- joint-space homing ('h' key) -------------------------------------------
-# retracted config, dVRK PSM order [outer_yaw, outer_pitch, insertion(m),
-# roll, wrist_pitch, wrist_yaw]: arm centered, wrist straight, tool withdrawn.
-# TUNE the insertion (index 2) so the tool is safely retracted for your setup.
-RETRACTED_JS = np.array([-0.7, 0.00, 0.06, 0.0, 0.0, 0.0])
-# jaw angle (deg) to open to before retracting, so the tool withdraws open.
+# --- homing ('h' key) -------------------------------------------------------
+# The home pose per arm is a Cartesian base->FEE target loaded from psm_home.npz
+# (see init_home); the arm Cartesian-servos there. Open the jaw before moving.
+# jaw angle (deg) to open to before homing, so the tool moves home open.
 OPEN_JAW_DEG = 40.0
 # the jaw moves this many times slower while closed (angle < 0 deg) than open.
 JAW_CLOSED_SLOW_FACTOR = 5.0
@@ -133,9 +131,6 @@ JAW_CLOSED_SLOW_FACTOR = 5.0
 # PSM_CLOSED_JAW_DEG), e.g. while grasping, for finer control.
 PSM_CLOSED_JAW_DEG = 4.0
 PSM_CLOSED_SLOW_FACTOR = 2.0
-# max increment per published command, per joint (rad for revolute, m for insertion).
-# Smaller -> more steps at the same publish cadence -> slower, smoother homing.
-HOME_JOINT_STEP = np.array([0.002, 0.002, 0.00010, 0.002, 0.002, 0.002])
 
 
 def _clamp(v, lo, hi):
@@ -269,6 +264,7 @@ class PSMControl():
         self._preempt = threading.Event()
 
         self.init_cam2base(args)
+        self.init_home(args)  # sets self.home_pose_base_fee {1:.., 2:..}
         self.pose_init = False # set to true when messages arrive
         psm1_pose_sub = Subscriber(self.node, PoseStamped, '/PSM1/measured_cp',) # meters
         psm2_pose_sub = Subscriber(self.node, PoseStamped, '/PSM2/measured_cp',) # meters
@@ -352,11 +348,6 @@ class PSMControl():
             PoseStamped, '/PSM1/servo_cp', 10)
         self.set_ee2_pub = self.node.create_publisher(
             PoseStamped, '/PSM2/servo_cp', 10)
-        # arm joint servo, used only by the 'h' joint-space homing/retract.
-        self.set_arm_jp_pub = {
-            1: self.node.create_publisher(JointState, '/PSM1/servo_jp', 10),
-            2: self.node.create_publisher(JointState, '/PSM2/servo_jp', 10),
-        }
 
         # published (Bool True) when a PSM move finishes (goal reached, settled,
         # or max iters) so the sim knows it can send the next step.
@@ -419,6 +410,31 @@ class PSMControl():
 
         self.H_cam_base_1_inv = np.linalg.inv(self.H_cam_base_1)
         self.H_cam_base_2_inv = np.linalg.inv(self.H_cam_base_2)
+
+    def init_home(self, args):
+        """
+        Load the per-arm home pose ('h' key target) from psm_home.npz. Each key
+        (PSM1, PSM2) is a 4x4 base->FEE homogeneous transform with the translation
+        in millimeters (same base frame as measured_cp / servo_cp, which are in
+        meters), so we convert mm->m. Stored as (qw,qx,qy,qz,x,y,z), the same
+        convention control_PSM / controlPoseFeeInBase expect.
+        """
+        home = args.psm_home
+        if not Path(home).exists():
+            raise FileNotFoundError(
+                f"PSM home file not found: {home}. "
+                f"Pass --psm_home <path to psm_home.npz>."
+            )
+        data = np.load(home)
+        self.home_pose_base_fee = {}
+        for psm_id, key in ((1, 'PSM1'), (2, 'PSM2')):
+            H = np.asarray(data[key], dtype=float)
+            pos_m = H[:3, 3] / 1000.0                       # mm -> m
+            quat_wxyz = quaternions.mat2quat(H[:3, :3])     # wxyz
+            self.home_pose_base_fee[psm_id] = np.array(
+                [*quat_wxyz, *pos_m], dtype=float)
+            self.node.get_logger().info(
+                f"PSM{psm_id} home pos (m): {pos_m}")
 
     def _pose_cb(self, pose_msg, psm_id):
         """
@@ -704,7 +720,7 @@ class PSMControl():
                 pass
             self._term_old_attrs = None  # restored; don't do it again
 
-    def control_PSM(self, psm, goal_pose_base_fee, pos_dist_th = 1e-3, angle_dist_th = 3 * np.pi / 180):
+    def control_PSM(self, psm, goal_pose_base_fee, pos_dist_th = 5e-4, angle_dist_th = 1 * np.pi / 180):
         # goal_pose_base_fee: (qw, qx, qy, qz, x, y, z), FEE pose in the PSM base frame
         if not self._ensure_ready(psm):
             self._publish_done(psm)  # can't move; don't leave the sim waiting
@@ -829,10 +845,10 @@ class PSMControl():
         self.psm_state_pub.publish(msg)
 
     # ------------------------------------------------------------------
-    # Joint-space homing ('h' key): retract both arms to RETRACTED_JS.
+    # Cartesian homing ('h' key): move both arms to the home poses in psm_home.npz.
     # ------------------------------------------------------------------
     def home_all(self):
-        """Retract both PSMs to the retracted joint config, one arm at a time."""
+        """Move both PSMs to their home Cartesian poses, one arm at a time."""
         if self._homing.is_set():
             print("[home] already homing; ignoring")
             return
@@ -840,15 +856,16 @@ class PSMControl():
         try:
             for psm in (1, 2):
                 self._home_arm(psm)
-            print("[home] both grippers retracted")
+            print("[home] both grippers homed")
         finally:
             self._homing.clear()
 
     def _home_arm(self, psm_id):
         """
-        Drive one PSM to RETRACTED_JS via joint servo (servo_jp), stepping each
-        joint by at most HOME_JOINT_STEP per command. Serialized with all other
-        control actions by _control_lock; interruptible with SPACE.
+        Open the gripper, then move one PSM to its home base->FEE pose (loaded
+        from psm_home.npz) using the normal Cartesian servo + collision-avoidance
+        pipeline. Serialized with all other control actions by _control_lock;
+        pausable with SPACE and preemptible by another 'h' press.
         """
         with self._control_lock:
             self._preempt.clear()  # consume the 'h' preempt; this homing run owns it
@@ -856,48 +873,31 @@ class PSMControl():
                 self.node.get_logger().error(
                     f"PSM{psm_id}: not ready; skipping homing")
                 return
-            joints = self.psm1_joints if psm_id == 1 else self.psm2_joints
-            if joints is None or len(joints) < len(RETRACTED_JS):
+
+            home_pose = self.home_pose_base_fee.get(psm_id)
+            if home_pose is None:
                 self.node.get_logger().error(
-                    f"PSM{psm_id}: no measured_js yet; skipping homing")
+                    f"PSM{psm_id}: no home pose loaded; skipping homing")
                 return
 
-            # Open the jaw before retracting. jaw/servo_jp and the arm servo_jp
-            # below are both JOINT_SPACE, so this does NOT flip control spaces.
+            # Open the jaw before moving (sets desired_jaw so it holds open).
             self._open_jaw_for_home(psm_id)
             if self._preempt.is_set():
-                print(f"[HOME] homing PSM{psm_id} preempted before retract")
+                print(f"[HOME] homing PSM{psm_id} preempted before move")
                 return
 
-            start = np.asarray(joints[:len(RETRACTED_JS)], dtype=float)
-            target = RETRACTED_JS.astype(float)
-            delta = target - start
-            n_steps = int(max(np.ceil(np.max(np.abs(delta) / HOME_JOINT_STEP)), 1))
-            pub = self.set_arm_jp_pub[psm_id]
-            print(f"[home] PSM{psm_id} joint-space retract in {n_steps} steps")
-
-            # servo_jp puts the arm in JOINT_SPACE; do NOT interleave jaw commands
-            # (that would flip control spaces and fault the wrist).
-            for s in range(1, n_steps + 1):
-                self._wait_if_paused()  # SPACE pause: hold mid-retract, then resume
-                if self._preempt.is_set():
-                    print(f"[HOME] homing PSM{psm_id} preempted")
-                    return
-                q = start + delta * (s / n_steps)
-                self._publish_arm_jp(pub, q)
-                time.sleep(0.01)
-
-            # a big joint move invalidates the once-captured zero-roll reference;
-            # recompute it on the next Cartesian goal.
-            self.init_quat[psm_id] = None
-            self._publish_done(psm_id)
-            print(f"[home] PSM{psm_id} retracted")
+            # Cartesian-servo to the home pose (same path as a normal goal: RRT
+            # around the other arm, closed-loop servo_cp, holds the open jaw, and
+            # publishes /done on completion).
+            print(f"[home] PSM{psm_id} moving to home pose {home_pose[-3:]}")
+            self.controlPoseFeeInBase(psm_id, home_pose)
+            print(f"[home] PSM{psm_id} homed")
 
     def _open_jaw_for_home(self, psm_id, step_deg=0.5, sleep=0.005):
         """
-        Smoothly open the jaw to OPEN_JAW_DEG before a retract. Steps in small
+        Smoothly open the jaw to OPEN_JAW_DEG before the home move. Steps in small
         increments (like control_jaw) but does NOT publish /done -- the caller
-        finishes the retract first. Interruptible with SPACE.
+        finishes the home move first. Interruptible with SPACE.
         """
         cur_rad = self._latest_jaw(psm_id)
         init_deg = (cur_rad * 180.0 / np.pi) if cur_rad is not None else 0.0
@@ -909,13 +909,6 @@ class PSMControl():
             if self._preempt.is_set():
                 return
             self.openGripperDegree(psm_id, degree=float(step), sleep=sleep)
-
-    def _publish_arm_jp(self, pub, positions):
-        """Publish a 6-joint arm servo_jp command (positions in rad / m)."""
-        msg = JointState()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-        msg.position = [float(x) for x in positions]
-        pub.publish(msg)
 
     # quat: wxyz
     def _publishPoseBaseFee(self, psm_id, set_ee_pub, pos, quat, sleep_time=0.01):
@@ -1299,6 +1292,9 @@ if __name__ == "__main__":
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
         default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
+    parser.add_argument('--psm_home',
+        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_home.npz",
+        help="npz with 4x4 base->FEE home pose per arm (keys PSM1/PSM2, mm)")
     args = parser.parse_args()
 
     rclpy.init(args=None)
