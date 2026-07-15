@@ -744,9 +744,8 @@ class PSMControl():
         The jaw is moved from its current angle to `degree` in small increments
         of at most `max_step_deg` degrees each so the motion stays smooth.
         '''
-        if not (-20 <= degree <= 90):
+        if not (-20 <= degree <= 120):
             print(f"degree goal is out of bound [-20 - 100], goal: {degree}")
-            pdb.set_trace()
         if psm in [1, 2] and not self._ensure_ready(psm):
             self._publish_done(psm)  # arm not ready (e.g. after teleop toggle)
             return
