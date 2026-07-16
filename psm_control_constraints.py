@@ -92,9 +92,34 @@ def slerp(q_now, q_end, max_move_angle=3.):
 # roll representation of a goal keeps the wrist roll joint away from its limit.
 Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
 
+# 180 deg rotation about the tool's local x axis (quat wxyz): reverses the shaft
+# (approach) direction, z -> -z. The commanded shaft direction should be kept
+# ("satisfied mostly"), but we allow flipping it to -z when that keeps the wrist
+# substantially further from its limit -- only if it saves > Z_FLIP_MARGIN_DEG of
+# wrist travel, so the approach is preserved unless the flip is really needed.
+Q_Z_FLIP = np.array([0., 1., 0., 0.])
+Z_FLIP_MARGIN_DEG = 30.0
+
 # index of the tool-roll joint in /PSM*/measured_js.
 # dVRK PSM joint order: [outer_yaw, outer_pitch, insertion, roll, wrist_pitch, wrist_yaw]
 ROLL_JOINT_IDX = 3
+
+# --- asymmetric jaw centering -----------------------------------------------
+# The two gripper fingers are independent actuators (see the LND coupling
+# matrix): their differential is the `jaw` opening and their common mode is
+# `wrist_yaw`, which sets where the opening is CENTERED. Because the fingers are
+# asymmetric, opening the jaw by angle J shifts the opening center off the
+# shaft/approach; a wrist_yaw bias moves it back so the opening stays centered on
+# the approach. We apply that bias by rotating the commanded orientation about
+# the FEE-local wrist_yaw (jaw-hinge) axis by WRIST_YAW_CENTER_GAIN * J.
+#
+# CALIBRATE on the robot: GAIN sign+magnitude and AXIS depend on the tool.
+#   GAIN = 0.0 disables (symmetric assumption / sim already handles it).
+#   GAIN = 0.5 assumes one finger is ~fixed and the other opens by J.
+# NOTE: wrist_yaw is part of the Cartesian orientation, so this re-points the tip
+# by the bias angle -- that coupling is inherent to shifting the jaw center here.
+WRIST_YAW_CENTER_GAIN = 0.5
+WRIST_YAW_LOCAL_AXIS = np.array([0., 1., 0.])  # FEE-local wrist_yaw / jaw-hinge axis
 
 # ---------------------------------------------------------------------------
 # Collision-avoidance / homing configuration (all distances in meters).
@@ -105,7 +130,7 @@ ROLL_JOINT_IDX = 3
 # stay above these clearances. TUNE these to your instruments/setup.
 # ---------------------------------------------------------------------------
 SHAFT_CLEARANCE = 0.012   # min centerline distance between the two shafts (planning)
-TIP_CLEARANCE = 0.012     # min distance between the two gripper tips (planning)
+TIP_CLEARANCE = 0.005     # min distance between the two gripper tips (planning)
 SHAFT_HARD_MIN = 0.008    # live safety guard during execution -> abort if breached
 
 # RRT (planned in the moving arm's base frame, R^3 tip position)
@@ -127,6 +152,11 @@ WAYPOINT_ANG_TH = 10 * np.pi / 180
 OPEN_JAW_DEG = 40.0
 # the jaw moves this many times slower while closed (angle < 0 deg) than open.
 JAW_CLOSED_SLOW_FACTOR = 5.0
+# jaw pacing while opening for a home move. Kept gentle (small step, longer
+# pause) so opening from a closed/grasping state doesn't yank the jaw and trip a
+# power-loss / tracking fault. Slowed a further JAW_CLOSED_SLOW_FACTOR below 0 deg.
+HOME_JAW_STEP_DEG = 0.2
+HOME_JAW_SLEEP = 0.01
 # the arm servos this many times slower while its jaw is closed (below
 # PSM_CLOSED_JAW_DEG), e.g. while grasping, for finer control.
 PSM_CLOSED_JAW_DEG = 4.0
@@ -622,18 +652,53 @@ class PSMControl():
         q_deroll = np.array([np.cos(-roll / 2.0), 0.0, 0.0, np.sin(-roll / 2.0)])
         return quaternions.qmult(pose[:4], q_deroll)
 
+    def _center_jaw_on_approach(self, goal_quat, psm_id):
+        """
+        Bias the commanded orientation about the FEE-local wrist_yaw (jaw-hinge)
+        axis so the ASYMMETRIC jaw opening stays centered on the approach as it
+        opens, instead of drifting off to one side.
+
+        The bias angle is WRIST_YAW_CENTER_GAIN * (held jaw opening, rad): a wider
+        opening tilts wrist_yaw more to re-center the pair. Returns goal_quat
+        unchanged when the gain is 0 or no jaw angle is known yet.
+
+        NOTE: wrist_yaw is part of the Cartesian orientation, so this re-points
+        the tip by the bias angle -- that coupling is inherent to shifting the
+        jaw center on this hardware. CALIBRATE GAIN/AXIS on the robot.
+        """
+        if WRIST_YAW_CENTER_GAIN == 0.0:
+            return goal_quat
+        jaw_deg = self.desired_jaw.get(psm_id)
+        if jaw_deg is None:
+            return goal_quat
+        phi = WRIST_YAW_CENTER_GAIN * np.deg2rad(float(jaw_deg))
+        ax = WRIST_YAW_LOCAL_AXIS / np.linalg.norm(WRIST_YAW_LOCAL_AXIS)
+        q_bias = np.array([np.cos(phi / 2.0), *(np.sin(phi / 2.0) * ax)])
+        return quaternions.qmult(np.asarray(goal_quat, float), q_bias)
+
     def _nearest_roll_goal(self, goal_quat, ref_quat):
         """
-        A symmetric gripper grasps the same after a 180 deg roll about its shaft.
-        Return whichever of {goal, goal rolled 180 deg about local z} keeps the
-        gripper orientation nearest ref_quat, so the wrist roll joint stays close
-        to its (in-range) startup value instead of wrapping toward a limit.
+        Pick the wrist orientation to servo to, keeping the wrist off its limit.
+
+        The grasp is unchanged by a 180 deg roll about the shaft (Q_ROLL_FLIP,
+        which preserves the +z approach). We PREFER to keep the commanded shaft
+        direction, but may flip it to -z (Q_Z_FLIP) when that keeps the wrist
+        substantially nearer its in-range reference -- "z must still satisfy
+        mostly, but can flip to negative if needed". Among the candidates we take
+        the one nearest ref_quat (least wrist travel), biased toward the +z pair
+        by Z_FLIP_MARGIN_DEG so the shaft only reverses when it clearly helps.
         """
-        goal_quat = np.asarray(goal_quat, dtype=float)
-        flipped = quaternions.qmult(goal_quat, Q_ROLL_FLIP)
-        d_goal, _ = angleDist(goal_quat, ref_quat)
-        d_flip, _ = angleDist(flipped, ref_quat)
-        return flipped if d_flip < d_goal else goal_quat
+        q = np.asarray(goal_quat, dtype=float)
+        pos = [q, quaternions.qmult(q, Q_ROLL_FLIP)]                 # +z preserved
+        neg = [quaternions.qmult(q, Q_Z_FLIP),                       # shaft -> -z
+               quaternions.qmult(q, quaternions.qmult(Q_ROLL_FLIP, Q_Z_FLIP))]
+        best_pos = min(pos, key=lambda c: angleDist(c, ref_quat)[0])
+        best_neg = min(neg, key=lambda c: angleDist(c, ref_quat)[0])
+        d_pos, _ = angleDist(best_pos, ref_quat)
+        d_neg, _ = angleDist(best_neg, ref_quat)
+        if d_neg + np.deg2rad(Z_FLIP_MARGIN_DEG) < d_pos:
+            return best_neg
+        return best_pos
 
     def debug_sync_status(self):
         if self.pose_init:
@@ -830,6 +895,32 @@ class PSMControl():
             self._setGripper(self.set_gripper2_pub, end_pos=degree)
         time.sleep(sleep)
 
+    def _move_jaw_smooth(self, psm_id, target_deg, step_deg=0.25, sleep=0.005):
+        """
+        Smoothly march the jaw from its current angle to target_deg and RETURN
+        only once it has arrived -- used to move the jaw fully before an arm
+        move. Steps a further JAW_CLOSED_SLOW_FACTOR slower while closed (< 0 deg)
+        and under load. No-op if already at the target. Respects SPACE pause and
+        'h' preempt; does NOT publish /done (the caller owns the arm move).
+        """
+        cur_rad = self._latest_jaw(psm_id)
+        if cur_rad is None:
+            return
+        init_deg = cur_rad * 180.0 / np.pi
+        if abs(target_deg - init_deg) < 1e-6:
+            return  # already there -> dVRK holds it, arm move can start
+        direction = 1.0 if target_deg >= init_deg else -1.0
+        pos = init_deg
+        while abs(pos - target_deg) > 1e-9:
+            self._wait_if_paused()  # SPACE pause: hold, then resume
+            if self._preempt.is_set():  # 'h' homing -> abort
+                return
+            step = step_deg / JAW_CLOSED_SLOW_FACTOR if pos < 0.0 else step_deg
+            pos += direction * step
+            if (direction > 0 and pos > target_deg) or (direction < 0 and pos < target_deg):
+                pos = target_deg  # clamp to target, don't overshoot
+            self.openGripperDegree(psm_id, degree=float(pos), sleep=sleep)
+
     def _publish_done(self, psm_id):
         """Signal that a PSM move finished so the sim can send the next step."""
         pub = self.done_pub_1 if psm_id == 1 else self.done_pub_2
@@ -892,22 +983,27 @@ class PSMControl():
             self.controlPoseFeeInBase(psm_id, home_pose)
             print(f"[home] PSM{psm_id} homed")
 
-    def _open_jaw_for_home(self, psm_id, step_deg=0.5, sleep=0.005):
+    def _open_jaw_for_home(self, psm_id, step_deg=HOME_JAW_STEP_DEG,
+                           sleep=HOME_JAW_SLEEP):
         """
-        Smoothly open the jaw to OPEN_JAW_DEG before the home move. Steps in small
-        increments (like control_jaw) but does NOT publish /done -- the caller
-        finishes the home move first. Interruptible with SPACE.
+        Gently open the jaw to OPEN_JAW_DEG before the home move. Marches up in
+        small increments -- and a further JAW_CLOSED_SLOW_FACTOR slower while the
+        jaw is still closed (< 0 deg) and under load -- so opening from a grasp
+        does not yank the jaw and trip a power-loss fault. Does NOT publish /done
+        (the caller finishes the home move). Interruptible with SPACE.
         """
         cur_rad = self._latest_jaw(psm_id)
         init_deg = (cur_rad * 180.0 / np.pi) if cur_rad is not None else 0.0
-        self.desired_jaw[psm_id] = OPEN_JAW_DEG  # hold this angle through the retract
-        n = max(int(np.ceil(abs(OPEN_JAW_DEG - init_deg) / step_deg)), 1)
+        self.desired_jaw[psm_id] = OPEN_JAW_DEG  # hold this angle through the move
         print(f"[home] PSM{psm_id} opening jaw {init_deg:.1f} -> {OPEN_JAW_DEG:.1f} deg")
-        for step in np.linspace(init_deg, OPEN_JAW_DEG, n + 1)[1:]:
+        pos = init_deg
+        while pos < OPEN_JAW_DEG - 1e-9:  # only ever opens (never drives closed)
             self._wait_if_paused()  # SPACE pause: hold mid jaw-open, then resume
             if self._preempt.is_set():
                 return
-            self.openGripperDegree(psm_id, degree=float(step), sleep=sleep)
+            step = step_deg / JAW_CLOSED_SLOW_FACTOR if pos < 0.0 else step_deg
+            pos = min(pos + step, OPEN_JAW_DEG)
+            self.openGripperDegree(psm_id, degree=float(pos), sleep=sleep)
 
     # quat: wxyz
     def _publishPoseBaseFee(self, psm_id, set_ee_pub, pos, quat, sleep_time=0.01):
@@ -1113,17 +1209,20 @@ class PSMControl():
                 maintain_jaw_angle = 60.0  # Fallback to 60 degrees open if it fails
         print(f"maintain jaw angle: {maintain_jaw_angle}")
 
-        # Command the jaw ONCE, before the servo_cp loop, then let dVRK hold it.
-        # On a dVRK PSM the jaw is joint 7 of the same arm/controller, so a
-        # jaw/servo_jp command forces the arm into JOINT_SPACE while servo_cp
-        # forces CARTESIAN_SPACE. Interleaving them every iteration made the arm
-        # flip-flop control spaces (JOINT<->CARTESIAN), which trips a PID
-        # tracking-error fault on the wrist_yaw joint. Sending the jaw once here
-        # (and only servo_cp in the loop) keeps the arm in CARTESIAN_SPACE.
-        self.openGripperDegree(psm_id=psm_id, degree=maintain_jaw_angle, sleep=0.05)
+        # ALWAYS move the jaw to its target FIRST, to completion, before moving
+        # the gripper location. This finishes all jaw/servo_jp (JOINT_SPACE)
+        # commands before the servo_cp loop (CARTESIAN_SPACE) begins -- one clean
+        # space transition (no JOINT<->CARTESIAN flip-flop, which faults the
+        # wrist) -- and the arm never starts moving while the jaw is still moving.
+        # It is a no-op if the jaw is already at the target (dVRK then holds it).
+        self._move_jaw_smooth(psm_id, maintain_jaw_angle)
 
         goal_pos = np.asarray(goal_pose_base_fee[-3:], dtype=float)
         goal_quat = np.asarray(goal_pose_base_fee[:4], dtype=float)
+
+        # bias wrist_yaw so the asymmetric jaw opening stays centered on the
+        # approach as it opens (the two fingers are wrist_yaw(center)+jaw(spread)).
+        goal_quat = self._center_jaw_on_approach(goal_quat, psm_id)
 
         # choose the roll representation (goal or 180 deg shaft flip) nearest the
         # zero-roll orientation so the wrist roll joint stays near 0 (off its
