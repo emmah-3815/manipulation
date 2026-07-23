@@ -87,18 +87,15 @@ def slerp(q_now, q_end, max_move_angle=3.):
     return q_now * np.cos(move_angle) + on_q_end * np.sin(move_angle)
 
 
-# 180 deg rotation about the tool's local z (shaft) axis, quat (w, x, y, z).
-# A symmetric gripper grasps the same after this flip, so we can choose whichever
-# roll representation of a goal keeps the wrist roll joint away from its limit.
-Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
+# Flipping is allowed ONLY as a 180 deg roll about the tool's local z (shaft)
+# axis (Q_ROLL_FLIP): it preserves the shaft/approach direction and just picks
+# the roll representation that keeps the wrist roll joint off its limit. The
+# shaft is NEVER reversed (no z -> -z flip about x, which flipped the z & y axes
+# to a wrong orientation). Set False to command the goal orientation exactly.
+ALLOW_ROLL_FLIP = True
 
-# 180 deg rotation about the tool's local x axis (quat wxyz): reverses the shaft
-# (approach) direction, z -> -z. The commanded shaft direction should be kept
-# ("satisfied mostly"), but we allow flipping it to -z when that keeps the wrist
-# substantially further from its limit -- only if it saves > Z_FLIP_MARGIN_DEG of
-# wrist travel, so the approach is preserved unless the flip is really needed.
-Q_Z_FLIP = np.array([0., 1., 0., 0.])
-Z_FLIP_MARGIN_DEG = 30.0
+# 180 deg rotation about the tool's local z (shaft) axis, quat (w, x, y, z).
+Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
 
 # index of the tool-roll joint in /PSM*/measured_js.
 # dVRK PSM joint order: [outer_yaw, outer_pitch, insertion, roll, wrist_pitch, wrist_yaw]
@@ -118,7 +115,10 @@ ROLL_JOINT_IDX = 3
 #   GAIN = 0.5 assumes one finger is ~fixed and the other opens by J.
 # NOTE: wrist_yaw is part of the Cartesian orientation, so this re-points the tip
 # by the bias angle -- that coupling is inherent to shifting the jaw center here.
-WRIST_YAW_CENTER_GAIN = 0.5
+# DISABLED by default (0.0): a nonzero gain re-points the commanded tip by the
+# bias angle, so the gripper frame no longer matches the pose the sim sends.
+# Only enable after calibrating GAIN sign/magnitude + AXIS on the robot.
+WRIST_YAW_CENTER_GAIN = 0.0
 WRIST_YAW_LOCAL_AXIS = np.array([0., 1., 0.])  # FEE-local wrist_yaw / jaw-hinge axis
 
 # ---------------------------------------------------------------------------
@@ -129,9 +129,9 @@ WRIST_YAW_LOCAL_AXIS = np.array([0., 1., 0.])  # FEE-local wrist_yaw / jaw-hinge
 # by requiring the shaft-shaft centerline distance and the tip-tip distance to
 # stay above these clearances. TUNE these to your instruments/setup.
 # ---------------------------------------------------------------------------
-SHAFT_CLEARANCE = 0.012   # min centerline distance between the two shafts (planning)
-TIP_CLEARANCE = 0.005     # min distance between the two gripper tips (planning)
-SHAFT_HARD_MIN = 0.008    # live safety guard during execution -> abort if breached
+SHAFT_CLEARANCE = 0.08   # min centerline distance between the two shafts (planning)
+TIP_CLEARANCE = 0.002     # min distance between the two gripper tips (planning)
+SHAFT_HARD_MIN = 0.004    # live safety guard during execution -> abort if breached
 
 # RRT (planned in the moving arm's base frame, R^3 tip position)
 RRT_STEP = 0.005          # extend distance per tree edge (m)
@@ -144,6 +144,15 @@ RRT_SHORTCUT_ITERS = 150  # path-smoothing attempts
 # waypoint-following tolerances (intermediate waypoints just pass through)
 WAYPOINT_POS_TH = 3e-3
 WAYPOINT_ANG_TH = 10 * np.pi / 180
+
+# The commanded servo_cp setpoint advances smoothly on its own and is only
+# allowed to run this far ahead of the MEASURED pose; past that we stop advancing
+# until the arm catches up. That is what keeps the command close to the actual
+# pose (no PID tracking-error fault) -- WITHOUT rebuilding the setpoint from the
+# noisy measured pose every iteration, which injected sensor noise straight into
+# the command at the loop rate and made the motion jittery.
+SERVO_MAX_LAG_M = 0.003     # max position lead of command over measured (m)
+SERVO_MAX_LAG_DEG = 5.0     # max orientation lead of command over measured (deg)
 
 # --- homing ('h' key) -------------------------------------------------------
 # The home pose per arm is a Cartesian base->FEE target loaded from psm_home.npz
@@ -678,27 +687,20 @@ class PSMControl():
 
     def _nearest_roll_goal(self, goal_quat, ref_quat):
         """
-        Pick the wrist orientation to servo to, keeping the wrist off its limit.
-
-        The grasp is unchanged by a 180 deg roll about the shaft (Q_ROLL_FLIP,
-        which preserves the +z approach). We PREFER to keep the commanded shaft
-        direction, but may flip it to -z (Q_Z_FLIP) when that keeps the wrist
-        substantially nearer its in-range reference -- "z must still satisfy
-        mostly, but can flip to negative if needed". Among the candidates we take
-        the one nearest ref_quat (least wrist travel), biased toward the +z pair
-        by Z_FLIP_MARGIN_DEG so the shaft only reverses when it clearly helps.
+        Pick the wrist orientation to servo to. Flipping is allowed ONLY as a
+        180 deg roll about the shaft (local z, Q_ROLL_FLIP), which preserves the
+        shaft/approach direction; the shaft is never reversed. Return whichever
+        of {goal, goal rolled 180 about z} is nearest ref_quat, so the wrist roll
+        joint stays off its limit. With ALLOW_ROLL_FLIP False, command the goal
+        orientation exactly (no flip).
         """
         q = np.asarray(goal_quat, dtype=float)
-        pos = [q, quaternions.qmult(q, Q_ROLL_FLIP)]                 # +z preserved
-        neg = [quaternions.qmult(q, Q_Z_FLIP),                       # shaft -> -z
-               quaternions.qmult(q, quaternions.qmult(Q_ROLL_FLIP, Q_Z_FLIP))]
-        best_pos = min(pos, key=lambda c: angleDist(c, ref_quat)[0])
-        best_neg = min(neg, key=lambda c: angleDist(c, ref_quat)[0])
-        d_pos, _ = angleDist(best_pos, ref_quat)
-        d_neg, _ = angleDist(best_neg, ref_quat)
-        if d_neg + np.deg2rad(Z_FLIP_MARGIN_DEG) < d_pos:
-            return best_neg
-        return best_pos
+        if not ALLOW_ROLL_FLIP:
+            return q
+        flipped = quaternions.qmult(q, Q_ROLL_FLIP)   # 180 deg roll about shaft z
+        d_goal, _ = angleDist(q, ref_quat)
+        d_flip, _ = angleDist(flipped, ref_quat)
+        return flipped if d_flip < d_goal else q
 
     def debug_sync_status(self):
         if self.pose_init:
@@ -1162,10 +1164,10 @@ class PSMControl():
         goal_pose_base_fee: np.ndarray,
         pos_dist_th: float = 1e-4,
         angle_dist_th: float = 5 * np.pi / 180,
-        pos_step: float = 9e-4,
-        angle_step_deg: float = 1.0,
+        pos_step: float = 9e-5,
+        angle_step_deg: float = 0.1,
         sleep: float = 0.005,
-        max_iters: int = 5000,
+        max_iters: int = 50000,
     ):
         """
         Move the PSM's end-effector (FEE) to a goal pose in the PSM base frame.
@@ -1272,7 +1274,7 @@ class PSMControl():
                 pos_dist_th=pos_dist_th if is_final else WAYPOINT_POS_TH,
                 angle_dist_th=angle_dist_th if is_final else WAYPOINT_ANG_TH,
                 pos_step=pos_step, angle_step_deg=angle_step_deg, sleep=sleep,
-                max_iters=max_iters if is_final else 2000, settle_iters=400,
+                max_iters=max_iters if is_final else 20000, settle_iters=400,
             )
             if status == 'stopped':
                 return  # 'h' homing preempt -> hold here, no done (homing owns it)
@@ -1288,10 +1290,14 @@ class PSMControl():
                          pos_dist_th, angle_dist_th, pos_step, angle_step_deg,
                          sleep, max_iters, settle_iters):
         """
-        Closed-loop servo of one FEE target (position + quat, base frame). Steps a
-        small bounded amount each iteration from the LIVE measured pose so every
-        servo_cp command stays close to the current pose (no PID tracking fault),
-        and re-checks clearance to the other arm live (guards against it moving).
+        Servo one FEE target (position + quat, base frame).
+
+        The published setpoint is advanced SMOOTHLY from its own previous value
+        (not rebuilt from the measured pose each iteration, which fed sensor noise
+        into the command and made the motion jittery). The measured pose is used
+        to (a) detect arrival/progress and (b) clamp how far the setpoint may lead
+        the arm (SERVO_MAX_LAG_*), which is what actually prevents the PID
+        tracking-error fault. Clearance to the other arm is re-checked live.
 
         Returns: 'reached' | 'settled' | 'maxiters' | 'stopped' | 'aborted'.
         Does NOT publish /done or touch the jaw -- the caller owns those.
@@ -1300,6 +1306,28 @@ class PSMControl():
         best_angle_dist = np.inf
         no_improve = 0
         start_meas_pos = None  # first measured pos, to report how far we actually moved
+        cmd_pos = None         # smoothly advanced setpoint (seeded from measured)
+        cmd_quat = None
+
+        # The jaw is held constant across this move (control_PSM finishes the jaw
+        # before servoing), so resolve the closed-jaw slowdown ONCE. Recomputing
+        # it per iteration made step_scale chatter between 1.0 and 1/FACTOR when
+        # the jaw sat near PSM_CLOSED_JAW_DEG -> oscillating step size -> jitter.
+        jaw_rad0 = self._latest_jaw(psm_id)
+        jaw_closed = (jaw_rad0 is not None and
+                      jaw_rad0 * 180.0 / np.pi < PSM_CLOSED_JAW_DEG)
+        step_scale = 1.0 / PSM_CLOSED_SLOW_FACTOR if jaw_closed else 1.0
+        eff_pos_step = pos_step * step_scale
+        eff_angle_step = angle_step_deg * step_scale
+        # scale the min-progress ("settled") thresholds with the step size: slower
+        # motion makes less progress per iteration, so a fixed threshold would
+        # falsely read as "no progress" and stop early.
+        # Tie them to the actual step: "progress" = at least half a commanded
+        # step. A fixed threshold would exceed the per-iteration motion at small
+        # step sizes and falsely trip the settle detector mid-move.
+        pos_improve_th = min(5e-5, 0.5 * eff_pos_step)
+        angle_improve_th = min(5e-4, 0.5 * np.deg2rad(eff_angle_step))
+        max_ang_lag = np.deg2rad(SERVO_MAX_LAG_DEG)
         for _ in range(max_iters):
             self._wait_if_paused()  # SPACE pause: hold pose here, resume in place
             if self._preempt.is_set():  # 'h' homing -> abort so homing takes over
@@ -1317,26 +1345,15 @@ class PSMControl():
 
             if start_meas_pos is None:
                 start_meas_pos = current_pos.copy()
+            if cmd_pos is None:  # seed the setpoint at the measured pose
+                cmd_pos = current_pos.copy()
+                cmd_quat = current_quat.copy()
 
             pos_dist = np.linalg.norm(target_pos - current_pos)
             angle_dist, _ = angleDist(current_quat, target_quat)
             if pos_dist < pos_dist_th and angle_dist < angle_dist_th:
                 return 'reached'
 
-            # move the arm 2x slower while its jaw is closed (< PSM_CLOSED_JAW_DEG)
-            # -> smaller per-command increments at the same cadence.
-            jaw_rad = self._latest_jaw(psm_id)
-            jaw_closed = (jaw_rad is not None and
-                          jaw_rad * 180.0 / np.pi < PSM_CLOSED_JAW_DEG)
-            step_scale = 1.0 / PSM_CLOSED_SLOW_FACTOR if jaw_closed else 1.0
-            eff_pos_step = pos_step * step_scale
-            eff_angle_step = angle_step_deg * step_scale
-
-            # scale the min-progress ("settled") thresholds with the step size:
-            # slower motion makes less progress per iteration, so a fixed
-            # threshold would falsely read as "no progress" and stop early.
-            pos_improve_th = 5e-5 * step_scale
-            angle_improve_th = 5e-4 * step_scale
             if (pos_dist < best_pos_dist - pos_improve_th or
                     angle_dist < best_angle_dist - angle_improve_th):
                 best_pos_dist = min(best_pos_dist, pos_dist)
@@ -1356,13 +1373,30 @@ class PSMControl():
                             f"wrong control space / joint limit) or measured_cp stale")
                     return 'settled'
 
-            if pos_dist > 1e-9:
-                next_pos = current_pos + \
-                    (target_pos - current_pos) * min(eff_pos_step, pos_dist) / pos_dist
-            else:
-                next_pos = current_pos
-            next_quat = slerp(current_quat, target_quat, max_move_angle=eff_angle_step) \
-                if angle_dist > 1e-6 else current_quat
+            # Advance the commanded setpoint smoothly from its OWN previous value
+            # (so measured-pose noise never enters the command), then "leash" it:
+            # clamp it to at most SERVO_MAX_LAG_* ahead of the measured pose. That
+            # bounds the tracking error like re-anchoring on measured used to,
+            # but continuously -- gating the advance on/off instead would stutter
+            # whenever the arm cannot keep up (e.g. against a joint limit).
+            d = target_pos - cmd_pos
+            dn = float(np.linalg.norm(d))
+            if dn > 1e-9:
+                cmd_pos = cmd_pos + d * min(eff_pos_step, dn) / dn
+            lead = cmd_pos - current_pos
+            lead_n = float(np.linalg.norm(lead))
+            if lead_n > SERVO_MAX_LAG_M:
+                cmd_pos = current_pos + lead * (SERVO_MAX_LAG_M / lead_n)
+
+            if angleDist(cmd_quat, target_quat)[0] > 1e-6:
+                cmd_quat = slerp(cmd_quat, target_quat,
+                                 max_move_angle=eff_angle_step)
+            if angleDist(cmd_quat, current_quat)[0] > max_ang_lag:
+                # pull the commanded orientation back onto the lag limit
+                cmd_quat = slerp(current_quat, cmd_quat,
+                                 max_move_angle=SERVO_MAX_LAG_DEG)
+
+            next_pos, next_quat = cmd_pos, cmd_quat
 
             # live safety guard: the planned path assumed a static obstacle; if the
             # other arm has moved into our way, refuse the step and hold.
@@ -1389,7 +1423,7 @@ if __name__ == "__main__":
     # parser.add_argument('--speedy',           action="store_true")
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
-        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
+        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_edited.npz")
     parser.add_argument('--psm_home',
         default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_home.npz",
         help="npz with 4x4 base->FEE home pose per arm (keys PSM1/PSM2, mm)")
