@@ -129,7 +129,7 @@ WRIST_YAW_LOCAL_AXIS = np.array([0., 1., 0.])  # FEE-local wrist_yaw / jaw-hinge
 # by requiring the shaft-shaft centerline distance and the tip-tip distance to
 # stay above these clearances. TUNE these to your instruments/setup.
 # ---------------------------------------------------------------------------
-SHAFT_CLEARANCE = 0.08   # min centerline distance between the two shafts (planning)
+SHAFT_CLEARANCE = 0.008   # min centerline distance between the two shafts (planning)
 TIP_CLEARANCE = 0.002     # min distance between the two gripper tips (planning)
 SHAFT_HARD_MIN = 0.004    # live safety guard during execution -> abort if breached
 
@@ -169,7 +169,7 @@ HOME_JAW_SLEEP = 0.01
 # the arm servos this many times slower while its jaw is closed (below
 # PSM_CLOSED_JAW_DEG), e.g. while grasping, for finer control.
 PSM_CLOSED_JAW_DEG = 4.0
-PSM_CLOSED_SLOW_FACTOR = 2.0
+PSM_CLOSED_SLOW_FACTOR = 4.0
 
 
 def _clamp(v, lo, hi):
