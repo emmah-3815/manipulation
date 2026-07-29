@@ -129,9 +129,9 @@ WRIST_YAW_LOCAL_AXIS = np.array([0., 1., 0.])  # FEE-local wrist_yaw / jaw-hinge
 # by requiring the shaft-shaft centerline distance and the tip-tip distance to
 # stay above these clearances. TUNE these to your instruments/setup.
 # ---------------------------------------------------------------------------
-SHAFT_CLEARANCE = 0.008   # min centerline distance between the two shafts (planning)
+SHAFT_CLEARANCE = 0.005   # min centerline distance between the two shafts (planning)
 TIP_CLEARANCE = 0.002     # min distance between the two gripper tips (planning)
-SHAFT_HARD_MIN = 0.004    # live safety guard during execution -> abort if breached
+SHAFT_HARD_MIN = 0.002    # live safety guard during execution -> abort if breached
 
 # RRT (planned in the moving arm's base frame, R^3 tip position)
 RRT_STEP = 0.005          # extend distance per tree edge (m)
