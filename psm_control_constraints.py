@@ -846,6 +846,9 @@ class PSMControl():
                 if (direction > 0 and pos > degree) or (direction < 0 and pos < degree):
                     pos = degree  # clamp to the goal, don't overshoot
                 self.openGripperDegree(psm, degree=float(pos), sleep=sleep)
+            # the marching loop only SENT the commands; wait for the physical jaw
+            # to actually stop moving before signaling done.
+            self._wait_jaw_settled(psm)
             # a jaw CLOSE (commanded to < 0 deg) just completed -> announce which
             # PSM most recently closed its jaws on /manipulate/psm.
             if degree < 0:
@@ -922,6 +925,40 @@ class PSMControl():
             if (direction > 0 and pos > target_deg) or (direction < 0 and pos < target_deg):
                 pos = target_deg  # clamp to target, don't overshoot
             self.openGripperDegree(psm_id, degree=float(pos), sleep=sleep)
+        # wait for the physical jaw to actually arrive before returning, so the
+        # arm move (and its /done) never proceeds while the jaw is still moving.
+        self._wait_jaw_settled(psm_id)
+
+    def _wait_jaw_settled(self, psm_id, timeout=3.0, still_tol_deg=0.3,
+                          still_iters=5):
+        """
+        Block until the MEASURED jaw has actually stopped moving (successive
+        readings within still_tol_deg for still_iters in a row) or `timeout`
+        elapses. The jaw is commanded open-loop, so its physical motion lags the
+        last servo_jp command -- this lets /done wait until the jaw has really
+        finished moving. Uses still-detection (not an exact target) so it also
+        handles grasping, where the jaw stops early on the object. Respects SPACE
+        pause and the 'h' preempt.
+        """
+        deadline = time.time() + timeout
+        prev = None
+        stable = 0
+        while time.time() < deadline:
+            if self._preempt.is_set():
+                return
+            self._wait_if_paused()
+            cur = self._latest_jaw(psm_id)
+            if cur is None:
+                return
+            cur_deg = cur * 180.0 / np.pi
+            if prev is not None and abs(cur_deg - prev) < still_tol_deg:
+                stable += 1
+                if stable >= still_iters:
+                    return
+            else:
+                stable = 0
+            prev = cur_deg
+            time.sleep(0.03)
 
     def _publish_done(self, psm_id):
         """Signal that a PSM move finished so the sim can send the next step."""
