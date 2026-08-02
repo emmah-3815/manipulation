@@ -133,6 +133,14 @@ SHAFT_CLEARANCE = 0.005   # min centerline distance between the two shafts (plan
 TIP_CLEARANCE = 0.002     # min distance between the two gripper tips (planning)
 SHAFT_HARD_MIN = 0.002    # live safety guard during execution -> abort if breached
 
+# --- user override ('b' key) ------------------------------------------------
+# When a move is refused (goal in collision / no RRT path) or aborted mid-flight
+# by the live guard, the move is REMEMBERED. Pressing 'b' re-runs exactly that
+# move with the collision checks disabled for that one move only: a straight tip
+# path to the goal, and no live guard to abort it. Collision avoidance is back on
+# for every subsequent move -- there is nothing latching to reset.
+# THE ARMS CAN COLLIDE during an overridden move; that is the point of the key.
+
 # RRT (planned in the moving arm's base frame, R^3 tip position)
 RRT_STEP = 0.005          # extend distance per tree edge (m)
 RRT_GOAL_BIAS = 0.10      # probability of sampling the goal
@@ -301,6 +309,14 @@ class PSMControl():
         # Homing clears it when it starts. Separate from _paused so homing is not
         # itself blocked by the pause.
         self._preempt = threading.Event()
+
+        # the most recent move stopped by collision avoidance (goal refused by
+        # the planner, or aborted mid-flight by the live guard), kept so 'b' can
+        # re-run it with the checks off. dict(psm_id, goal, kwargs, reason) or
+        # None. Replaced by each new block; consumed by the retry.
+        self._blocked_move = None
+        # set while a 'b' retry is running, so repeated presses don't stack.
+        self._retrying = threading.Event()
 
         self.init_cam2base(args)
         self.init_home(args)  # sets self.home_pose_base_fee {1:.., 2:..}
@@ -732,7 +748,8 @@ class PSMControl():
         Read single keypresses from the terminal. SPACE toggles PAUSE: the first
         press pauses (the active motion parks and holds its pose, and every
         incoming goal/jaw call blocks until resumed); the next press resumes.
-        H retracts both grippers to home. Runs in its own thread.
+        H retracts both grippers to home. B re-attempts the move collision
+        avoidance last blocked, ignoring collision. Runs in its own thread.
         """
         if not sys.stdin.isatty():
             self.node.get_logger().warn(
@@ -740,7 +757,8 @@ class PSMControl():
             return
 
         print("[keyboard] SPACE = pause/resume (toggle), "
-              "H = retract both grippers to home")
+              "H = retract both grippers to home, "
+              "B = re-attempt the blocked move ignoring collision")
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         # record for _restore_terminal (atexit / main finally), since this
@@ -772,6 +790,15 @@ class PSMControl():
                         self._preempt.set()
                         print("\n[HOME] h pressed - retracting both grippers")
                         threading.Thread(target=self.home_all, daemon=True).start()
+                    elif ch in ('b', 'B'):
+                        # re-run the move collision avoidance just blocked,
+                        # ignoring the collision warning. Backgrounded so this
+                        # listener stays responsive while the retry waits for
+                        # the control lock and then moves.
+                        print("\n[COLLISION] b pressed - re-attempting the "
+                              "blocked move, ignoring collision")
+                        threading.Thread(target=self.retry_blocked_move,
+                                         daemon=True).start()
         finally:
             self._restore_terminal()
 
@@ -1102,6 +1129,10 @@ class PSMControl():
         """
         True if placing PSM `psm_id`'s tip at `tip_base` (its base frame) keeps
         both the shaft-shaft and tip-tip clearances against `obstacle`.
+
+        `obstacle` is None when the other arm's pose is unknown, and also when a
+        'b' override is running -- both mean "nothing to avoid", so the planner
+        returns a straight tip path.
         """
         if obstacle is None:
             return True
@@ -1195,6 +1226,62 @@ class PSMControl():
                 path = path[:a + 1] + path[b:]
         return path
 
+    # ------------------------------------------------------------------
+    # 'b' override: re-run the move collision avoidance just prevented.
+    # ------------------------------------------------------------------
+    def _remember_blocked_move(self, psm_id, goal_pose_base_fee, reason, **kwargs):
+        """
+        Record a move that collision avoidance just stopped, so pressing 'b' can
+        re-run it with the checks off. Only the most recent block is kept.
+        """
+        self._blocked_move = {
+            'psm_id': psm_id,
+            'goal': np.asarray(goal_pose_base_fee, dtype=float).copy(),
+            'kwargs': kwargs,
+            'reason': reason,
+        }
+        print(f"[COLLISION] PSM{psm_id} move blocked ({reason}); "
+              f"press 'b' to re-run it ignoring collision")
+
+    def retry_blocked_move(self):
+        """
+        Re-run the last move collision avoidance prevented, with the checks
+        disabled for that move only ('b' key). Runs in its own thread and takes
+        _control_lock like any other control action, so it waits for whatever is
+        currently moving. The blocked move is consumed on entry: one press, one
+        retry, and collision avoidance is fully active again afterwards.
+
+        /done is NOT re-published -- the blocked attempt already sent one, and a
+        second would advance the sim an extra step.
+        """
+        if self._retrying.is_set():
+            print("[COLLISION] already retrying; ignoring")
+            return
+        blocked = self._blocked_move
+        if blocked is None:
+            print("[COLLISION] no blocked move to retry")
+            return
+        self._retrying.set()
+        try:
+            self._blocked_move = None  # consume it; one press = one retry
+            psm_id = blocked['psm_id']
+            with self._control_lock:
+                if not self._ensure_ready(psm_id):
+                    self.node.get_logger().error(
+                        f"PSM{psm_id}: not ready; skipping collision override")
+                    return
+                print(f"[COLLISION] OVERRIDE: re-running the PSM{psm_id} move "
+                      f"blocked because the {blocked['reason']} -- collision "
+                      f"checks OFF for this move, the arms can collide")
+                self.controlPoseFeeInBase(
+                    psm_id, blocked['goal'],
+                    ignore_collision=True, announce_done=False,
+                    **blocked['kwargs'])
+                print(f"[COLLISION] override move for PSM{psm_id} finished; "
+                      f"collision avoidance is active again")
+        finally:
+            self._retrying.clear()
+
     def controlPoseFeeInBase(
         self,
         psm_id: int,
@@ -1205,6 +1292,8 @@ class PSMControl():
         angle_step_deg: float = 0.1,
         sleep: float = 0.005,
         max_iters: int = 50000,
+        ignore_collision: bool = False,
+        announce_done: bool = True,
     ):
         """
         Move the PSM's end-effector (FEE) to a goal pose in the PSM base frame.
@@ -1228,6 +1317,12 @@ class PSMControl():
             angle_step_deg: max rotational increment per published command (deg)
             sleep: pause between published commands (s)
             max_iters: safety cap on the number of published commands
+            ignore_collision: skip BOTH collision layers for this one move (a 'b'
+                override of a move that was just blocked): straight tip path to
+                the goal, and no live guard to abort it.
+            announce_done: publish /done when the move finishes. False for a 'b'
+                retry, whose blocked attempt already published one -- a second
+                would advance the sim an extra step.
         """
 
         set_ee_pub = self.set_ee1_pub if psm_id == 1 else self.set_ee2_pub
@@ -1283,16 +1378,26 @@ class PSMControl():
         if cur is None:
             self.node.get_logger().error(
                 f"PSM{psm_id}: no measured pose yet; cannot plan, skipping move")
-            self._publish_done(psm_id)
+            if announce_done:
+                self._publish_done(psm_id)
             return
         start_pos = np.asarray(cur[-3:], dtype=float)
         start_quat = np.asarray(cur[:4], dtype=float)
 
-        obstacle = self._obstacle_shaft_cam(psm_id)  # other arm's shaft (snapshot)
+        # other arm's shaft (snapshot). None for a 'b' override -> the planner
+        # sees no obstacle and returns the straight line to the goal.
+        obstacle = None if ignore_collision else self._obstacle_shaft_cam(psm_id)
         path = self._plan_path(psm_id, start_pos, goal_pos, obstacle)
         if path is None:
-            # goal in collision or no path found -> hold, but let the sim advance
-            self._publish_done(psm_id)
+            # goal in collision or no path found -> hold, but let the sim advance.
+            # Remember it so 'b' can re-run this move with the checks off.
+            self._remember_blocked_move(
+                psm_id, goal_pose_base_fee, 'planner refused the goal',
+                pos_dist_th=pos_dist_th, angle_dist_th=angle_dist_th,
+                pos_step=pos_step, angle_step_deg=angle_step_deg,
+                sleep=sleep, max_iters=max_iters)
+            if announce_done:
+                self._publish_done(psm_id)
             return
         if len(path) > 2:
             print(f"[plan] PSM{psm_id} routing around other arm: {len(path)} waypoints")
@@ -1312,20 +1417,30 @@ class PSMControl():
                 angle_dist_th=angle_dist_th if is_final else WAYPOINT_ANG_TH,
                 pos_step=pos_step, angle_step_deg=angle_step_deg, sleep=sleep,
                 max_iters=max_iters if is_final else 20000, settle_iters=400,
+                ignore_collision=ignore_collision,
             )
             if status == 'stopped':
                 return  # 'h' homing preempt -> hold here, no done (homing owns it)
             if status == 'aborted':
-                # live collision guard tripped -> hold here, but tell the sim
-                self._publish_done(psm_id)
+                # live collision guard tripped -> hold here, but tell the sim.
+                # Remember the FULL move (from its original goal) so 'b' re-runs
+                # it, not just the waypoint we stopped on.
+                self._remember_blocked_move(
+                    psm_id, goal_pose_base_fee, 'live guard aborted the move',
+                    pos_dist_th=pos_dist_th, angle_dist_th=angle_dist_th,
+                    pos_step=pos_step, angle_step_deg=angle_step_deg,
+                    sleep=sleep, max_iters=max_iters)
+                if announce_done:
+                    self._publish_done(psm_id)
                 return
 
         # reached goal / settled / max-iters -> the move is done, tell the sim.
-        self._publish_done(psm_id)
+        if announce_done:
+            self._publish_done(psm_id)
 
     def _servo_to_target(self, psm_id, set_ee_pub, target_pos, target_quat,
                          pos_dist_th, angle_dist_th, pos_step, angle_step_deg,
-                         sleep, max_iters, settle_iters):
+                         sleep, max_iters, settle_iters, ignore_collision=False):
         """
         Servo one FEE target (position + quat, base frame).
 
@@ -1335,6 +1450,9 @@ class PSMControl():
         to (a) detect arrival/progress and (b) clamp how far the setpoint may lead
         the arm (SERVO_MAX_LAG_*), which is what actually prevents the PID
         tracking-error fault. Clearance to the other arm is re-checked live.
+
+        With ignore_collision (a 'b' override), the live clearance guard is not
+        evaluated at all, so this never returns 'aborted'.
 
         Returns: 'reached' | 'settled' | 'maxiters' | 'stopped' | 'aborted'.
         Does NOT publish /done or touch the jaw -- the caller owns those.
@@ -1436,8 +1554,9 @@ class PSMControl():
             next_pos, next_quat = cmd_pos, cmd_quat
 
             # live safety guard: the planned path assumed a static obstacle; if the
-            # other arm has moved into our way, refuse the step and hold.
-            obstacle = self._obstacle_shaft_cam(psm_id)
+            # other arm has moved into our way, refuse the step and hold. Skipped
+            # for a 'b' override move, which is deliberately allowed to collide.
+            obstacle = None if ignore_collision else self._obstacle_shaft_cam(psm_id)
             if obstacle is not None:
                 B_o, T_o = obstacle
                 B_a = self._base_origin_cam(psm_id)
