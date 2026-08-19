@@ -179,6 +179,15 @@ HOME_JAW_SLEEP = 0.01
 PSM_CLOSED_JAW_DEG = 4.0
 PSM_CLOSED_SLOW_FACTOR = 4.0
 
+# --- per-arm jaw slack compensation ------------------------------------------
+# PSM2's jaw cables have slack, so the measured angle overstates the physical
+# opening -- it reads ~5 deg open while the jaw is actually shut. Every
+# commanded jaw motion is overshot by this many degrees IN THE DIRECTION OF
+# TRAVEL, so the slack is taken up and the physical jaw reaches the angle that
+# was asked for. The measured angle then reads ~this much past the goal; that
+# is expected, it is the slack being held out. PSM1 tracks fine -> 0.
+JAW_SLACK_OVERSHOOT_DEG = {1: 0.0, 2: 0.0}
+
 
 def _clamp(v, lo, hi):
     return max(lo, min(v, hi))
@@ -259,12 +268,11 @@ class PSMControl():
         self.pose_base_fee2 = None
         self.jaw_effort = {'psm_1': None, 'psm_2': None}  # latest jaw effort (N·m)
         self.desired_jaw = {1: None, 2: None}  # latest commanded jaw angle (deg)
-        # jaw angle (deg) from a /jaw_goal that has ARRIVED but has not been
-        # acted on yet. Recorded in the jaw callback the moment the message
-        # lands -- before _wait_if_paused / the control lock -- so a pose move
-        # holding the lock can see that a jaw change is still owed and finish it
-        # before publishing /done. Cleared once the angle has been attempted.
-        self.pending_jaw = {1: None, 2: None}
+        # last jaw goal as ASKED FOR (before slack overshoot) and as SENT (after),
+        # per arm. _jaw_overshoot needs the asked-for value to tell which way the
+        # jaw is travelling, and the sent value to stay put on a repeated goal.
+        self.jaw_goal_asked = {1: None, 2: None}
+        self.jaw_goal_sent = {1: None, 2: None}
         self.psm1_joints = None  # latest /PSM1/measured_js positions (rad/m)
         self.psm2_joints = None
         # gripper orientation (wxyz) with the tool-roll joint at 0, captured once
@@ -541,20 +549,14 @@ class PSMControl():
 
     def psm1_jaw_callback(self, psm1_jaw_msg):
         rad = psm1_jaw_msg.position[0]
-        degree = self._normalize_jaw_deg(rad / np.pi * 180)
-        # publish the owed angle BEFORE blocking, so a pose move that wins the
-        # control lock can service it rather than /done-ing past it.
-        self.pending_jaw[1] = degree
+        degree = rad / np.pi * 180
         self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_jaw(psm=1, degree=degree, stop_on_effort=True)
 
     def psm2_jaw_callback(self, psm2_jaw_msg):
         rad = psm2_jaw_msg.position[0]
-        degree = self._normalize_jaw_deg(rad / np.pi * 180)
-        # publish the owed angle BEFORE blocking, so a pose move that wins the
-        # control lock can service it rather than /done-ing past it.
-        self.pending_jaw[2] = degree
+        degree = rad / np.pi * 180
         self._wait_if_paused()  # SPACE pause: hold this call until resumed
         with self._control_lock:  # serialize with all other control actions
             self.control_jaw(psm=2, degree=degree, stop_on_effort=True)
@@ -856,12 +858,12 @@ class PSMControl():
             self._publish_done(psm)  # arm not ready (e.g. after teleop toggle)
             return
         if psm in [1, 2]:
-            degree = self._normalize_jaw_deg(degree)
-            # this goal is being serviced now -> it is no longer owed. Only clear
-            # it if it is still THIS angle: a newer /jaw_goal may have landed
-            # while this call waited for the lock, and that one is still pending.
-            if self.pending_jaw[psm] == degree:
-                self.pending_jaw[psm] = None
+            if degree == 0:
+                degree = -9
+            # take up this arm's cable slack: overshoot the goal in the direction
+            # of travel. Everything below (including desired_jaw, which a pose
+            # move holds) uses the overshot value, so nothing drives it back.
+            degree = self._jaw_overshoot(psm, degree)
             # latest commanded jaw angle; controlPoseFeeInBase holds this while moving
             self.desired_jaw[psm] = degree
             rad = self.psm1_current_jaw if psm==1 else self.psm2_current_jaw # get the current state of the robot
@@ -943,6 +945,44 @@ class PSMControl():
             self._setGripper(self.set_gripper2_pub, end_pos=degree)
         time.sleep(sleep)
 
+    def _jaw_overshoot(self, psm, degree):
+        """
+        Overshoot a commanded jaw angle by JAW_SLACK_OVERSHOOT_DEG[psm] in the
+        direction of travel, so cable slack is taken up and the physical jaw
+        reaches the commanded angle. Returns `degree` unchanged for an arm with
+        no configured slack (PSM1).
+
+        The direction comes from the previous ASKED-FOR goal, not the measured
+        angle. Measuring would compare against a position that already includes
+        the last overshoot, so re-sending the same goal would read as travel the
+        other way and walk the jaw back and forth by twice the overshoot. A
+        repeated goal therefore re-sends exactly what was sent last time.
+        """
+        slack = JAW_SLACK_OVERSHOOT_DEG.get(psm, 0.0)
+        if slack == 0.0:
+            return degree
+
+        prev = self.jaw_goal_asked[psm]
+        if prev is None:  # first goal since startup -> travel from where we are
+            cur_rad = self._latest_jaw(psm)
+            prev = cur_rad * 180.0 / np.pi if cur_rad is not None else degree
+
+        if degree > prev:
+            sent = degree + slack       # opening
+        elif degree < prev:
+            sent = degree - slack       # closing
+        else:                           # same goal again -> hold what we sent
+            sent = self.jaw_goal_sent[psm]
+            if sent is None:
+                sent = degree
+
+        self.jaw_goal_asked[psm] = degree
+        self.jaw_goal_sent[psm] = sent
+        if sent != degree:
+            print(f"[jaw] PSM{psm} slack overshoot: goal {degree:.2f} -> "
+                  f"commanding {sent:.2f} deg")
+        return sent
+
     def _move_jaw_smooth(self, psm_id, target_deg, step_deg=0.25, sleep=0.005):
         """
         Smoothly march the jaw from its current angle to target_deg and RETURN
@@ -971,52 +1011,6 @@ class PSMControl():
         # wait for the physical jaw to actually arrive before returning, so the
         # arm move (and its /done) never proceeds while the jaw is still moving.
         self._wait_jaw_settled(psm_id)
-
-    @staticmethod
-    def _normalize_jaw_deg(degree):
-        """A commanded 0 deg is a full close; drive to -9 deg so the jaw really
-        shuts (and reads as closed for /manipulate/psm)."""
-        return -9 if degree == 0 else degree
-
-    def _apply_pending_jaw(self, psm_id):
-        """
-        Move the jaw to a /jaw_goal that arrived but has not been acted on yet.
-
-        A pose goal and a jaw goal for the same sim step race for the control
-        lock. When the pose goal wins AND the pose barely changes, the servo
-        loop returns immediately -- so /done would go out while the queued jaw
-        goal has not moved the jaw at all, and the sim advances a step early.
-        Calling this before /done keeps that signal meaning "pose AND jaw are
-        where this step asked for". No-op when nothing is owed.
-
-        The pending angle is cleared whether or not the jaw reached it (a grasp
-        stops early on the object), so it is attempted once and not re-squeezed
-        on every later move; control_jaw's own march then finds it already there.
-        """
-        degree = self.pending_jaw[psm_id]
-        if degree is None:
-            return
-        self.pending_jaw[psm_id] = None
-        # hold this angle through any later pose move, as control_jaw would
-        self.desired_jaw[psm_id] = degree
-        cur_rad = self._latest_jaw(psm_id)
-        if cur_rad is not None and abs(cur_rad * 180.0 / np.pi - degree) < 1e-6:
-            return  # already there
-        print(f"[jaw] PSM{psm_id} pose move finished with a jaw goal still "
-              f"pending ({degree:.2f} deg); moving the jaw before /done")
-        self._move_jaw_smooth(psm_id, degree)
-        # a close (< 0 deg) just completed -> same announcement control_jaw makes
-        if degree < 0:
-            self._publish_psm_state(psm_id)
-
-    def _finish_pose_move(self, psm_id, announce_done):
-        """
-        End a pose move: service a jaw goal that is still owed (the pose may not
-        have changed at all, but the jaw angle still has to), then tell the sim.
-        """
-        self._apply_pending_jaw(psm_id)
-        if announce_done:
-            self._publish_done(psm_id)
 
     def _wait_jaw_settled(self, psm_id, timeout=3.0, still_tol_deg=0.3,
                           still_iters=5):
@@ -1390,14 +1384,6 @@ class PSMControl():
         set_ee_pub = self.set_ee1_pub if psm_id == 1 else self.set_ee2_pub
 
         # --- Jaw angle to hold while moving ---
-        # A jaw goal for this same step may already have arrived and be waiting
-        # behind us on the control lock. Adopt it here so the jaw is moved to the
-        # NEW angle below (still before the arm moves), instead of holding the
-        # previous one and only reaching the new one after /done.
-        pending = self.pending_jaw[psm_id]
-        if pending is not None:
-            self.pending_jaw[psm_id] = None
-            self.desired_jaw[psm_id] = pending
         # Prefer the latest angle commanded via control_jaw so a pose move never
         # fights a jaw goal; fall back to the current measured jaw if none yet.
         maintain_jaw_angle = self.desired_jaw[psm_id]
@@ -1448,7 +1434,8 @@ class PSMControl():
         if cur is None:
             self.node.get_logger().error(
                 f"PSM{psm_id}: no measured pose yet; cannot plan, skipping move")
-            self._finish_pose_move(psm_id, announce_done)
+            if announce_done:
+                self._publish_done(psm_id)
             return
         start_pos = np.asarray(cur[-3:], dtype=float)
         start_quat = np.asarray(cur[:4], dtype=float)
@@ -1465,7 +1452,8 @@ class PSMControl():
                 pos_dist_th=pos_dist_th, angle_dist_th=angle_dist_th,
                 pos_step=pos_step, angle_step_deg=angle_step_deg,
                 sleep=sleep, max_iters=max_iters)
-            self._finish_pose_move(psm_id, announce_done)
+            if announce_done:
+                self._publish_done(psm_id)
             return
         if len(path) > 2:
             print(f"[plan] PSM{psm_id} routing around other arm: {len(path)} waypoints")
@@ -1498,14 +1486,13 @@ class PSMControl():
                     pos_dist_th=pos_dist_th, angle_dist_th=angle_dist_th,
                     pos_step=pos_step, angle_step_deg=angle_step_deg,
                     sleep=sleep, max_iters=max_iters)
-                self._finish_pose_move(psm_id, announce_done)
+                if announce_done:
+                    self._publish_done(psm_id)
                 return
 
-        # reached goal / settled / max-iters -> the move is done. A jaw goal that
-        # landed while we were servoing (or while we were not moving at all, when
-        # the goal pose matched the current one) is finished first, so /done never
-        # goes out with a jaw change still owed.
-        self._finish_pose_move(psm_id, announce_done)
+        # reached goal / settled / max-iters -> the move is done, tell the sim.
+        if announce_done:
+            self._publish_done(psm_id)
 
     def _servo_to_target(self, psm_id, set_ee_pub, target_pos, target_quat,
                          pos_dist_th, angle_dist_th, pos_step, angle_step_deg,
@@ -1648,7 +1635,7 @@ if __name__ == "__main__":
     # parser.add_argument('--speedy',           action="store_true")
     # parser.add_argument('--calib',            default=None)
     parser.add_argument('--psm_calibrate',
-        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_edited.npz")
+        default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_calibration_servo.npz")
     parser.add_argument('--psm_home',
         default=os.path.dirname(__file__) + "/../RaftStereo/assets/psm_home.npz",
         help="npz with 4x4 base->FEE home pose per arm (keys PSM1/PSM2, mm)")
