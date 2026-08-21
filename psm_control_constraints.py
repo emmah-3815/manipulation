@@ -141,6 +141,15 @@ SHAFT_HARD_MIN = 0.002    # live safety guard during execution -> abort if breac
 # for every subsequent move -- there is nothing latching to reset.
 # THE ARMS CAN COLLIDE during an overridden move; that is the point of the key.
 
+# --- collision avoidance master switch --------------------------------------
+# False disables BOTH layers for EVERY move -- the same thing a 'b' override
+# does for a single move: the planner sees no obstacle and returns the straight
+# tip path to the goal, and no live guard can abort the motion. No goal is ever
+# refused, so nothing is ever remembered for 'b' to retry.
+# Set back to True to restore normal avoidance.
+# THE ARMS CAN COLLIDE while this is False.
+COLLISION_AVOIDANCE = False
+
 # RRT (planned in the moving arm's base frame, R^3 tip position)
 RRT_STEP = 0.005          # extend distance per tree edge (m)
 RRT_GOAL_BIAS = 0.10      # probability of sampling the goal
@@ -1382,6 +1391,11 @@ class PSMControl():
         """
 
         set_ee_pub = self.set_ee1_pub if psm_id == 1 else self.set_ee2_pub
+
+        # master switch off -> run every move as a 'b' override: no planner
+        # obstacle, no live guard, straight tip path to the goal.
+        if not COLLISION_AVOIDANCE:
+            ignore_collision = True
 
         # --- Jaw angle to hold while moving ---
         # Prefer the latest angle commanded via control_jaw so a pose move never
