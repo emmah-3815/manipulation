@@ -92,7 +92,7 @@ def slerp(q_now, q_end, max_move_angle=3.):
 # the roll representation that keeps the wrist roll joint off its limit. The
 # shaft is NEVER reversed (no z -> -z flip about x, which flipped the z & y axes
 # to a wrong orientation). Set False to command the goal orientation exactly.
-ALLOW_ROLL_FLIP = True
+ALLOW_ROLL_FLIP = False
 
 # 180 deg rotation about the tool's local z (shaft) axis, quat (w, x, y, z).
 Q_ROLL_FLIP = np.array([0., 0., 0., 1.])
